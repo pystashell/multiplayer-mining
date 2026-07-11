@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Difficulty = "beginner" | "intermediate" | "expert";
 type CellState = "hidden" | "flagged" | "questioned" | "revealed";
@@ -145,12 +145,16 @@ export function MinefieldApp() {
   const [notice, setNotice] = useState("");
   const [connected, setConnected] = useState(true);
   const [tapMode, setTapMode] = useState<"reveal" | "mark">("reveal");
+  const [chordPreviewIndex, setChordPreviewIndex] = useState<number | null>(null);
   const [now, setNow] = useState(0);
   const roomRef = useRef<Room | null>(null);
   const sessionRef = useRef<Session | null>(null);
   const actionQueue = useRef<Promise<void>>(Promise.resolve());
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressedIndex = useRef<number | null>(null);
+  const chordGestureIndex = useRef<number | null>(null);
+  const suppressContextMenuIndex = useRef<number | null>(null);
+  const suppressContextMenuTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     roomRef.current = room;
@@ -255,6 +259,26 @@ export function MinefieldApp() {
     const timer = window.setTimeout(() => setNotice(""), 2200);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  useEffect(() => {
+    const cancelHeldChord = () => {
+      const heldIndex = chordGestureIndex.current;
+      chordGestureIndex.current = null;
+      setChordPreviewIndex(null);
+      if (heldIndex !== null) {
+        suppressContextMenuIndex.current = heldIndex;
+        if (suppressContextMenuTimer.current) clearTimeout(suppressContextMenuTimer.current);
+        suppressContextMenuTimer.current = setTimeout(() => {
+          if (suppressContextMenuIndex.current === heldIndex) suppressContextMenuIndex.current = null;
+        }, 500);
+      }
+    };
+    window.addEventListener("blur", cancelHeldChord);
+    return () => {
+      window.removeEventListener("blur", cancelHeldChord);
+      if (suppressContextMenuTimer.current) clearTimeout(suppressContextMenuTimer.current);
+    };
+  }, []);
 
   const persistSession = (next: Session) => {
     window.localStorage.setItem(SESSION_KEY, JSON.stringify(next));
@@ -403,6 +427,39 @@ export function MinefieldApp() {
     longPressTimer.current = null;
   };
 
+  const beginClassicChord = (event: ReactMouseEvent, cell: PublicCell) => {
+    const isBothPrimaryButtons = (event.buttons & 3) === 3;
+    if (!isBothPrimaryButtons || cell.state !== "revealed" || !cell.adjacent) return;
+    event.preventDefault();
+    chordGestureIndex.current = cell.index;
+    suppressContextMenuIndex.current = cell.index;
+    setChordPreviewIndex(cell.index);
+  };
+
+  const finishClassicChord = (event: ReactMouseEvent, cell: PublicCell) => {
+    if (chordGestureIndex.current !== cell.index || (event.buttons & 3) === 3) return;
+    event.preventDefault();
+    chordGestureIndex.current = null;
+    suppressContextMenuIndex.current = cell.index;
+    setChordPreviewIndex(null);
+    if (suppressContextMenuTimer.current) clearTimeout(suppressContextMenuTimer.current);
+    suppressContextMenuTimer.current = setTimeout(() => {
+      if (suppressContextMenuIndex.current === cell.index) suppressContextMenuIndex.current = null;
+    }, 500);
+    commitAction({ type: "chord", index: cell.index });
+  };
+
+  const cancelClassicChord = (cellIndex: number) => {
+    if (chordGestureIndex.current !== cellIndex) return;
+    chordGestureIndex.current = null;
+    setChordPreviewIndex(null);
+    suppressContextMenuIndex.current = cellIndex;
+    if (suppressContextMenuTimer.current) clearTimeout(suppressContextMenuTimer.current);
+    suppressContextMenuTimer.current = setTimeout(() => {
+      if (suppressContextMenuIndex.current === cellIndex) suppressContextMenuIndex.current = null;
+    }, 500);
+  };
+
   const status = room ? statusCopy(room.game, room.players) : null;
   const seconds = room ? secondsFor(room.game, now) : 0;
   const currentDifficulty = room?.game.difficulty ?? difficulty;
@@ -521,7 +578,15 @@ export function MinefieldApp() {
               <div className="mine-board" style={boardStyle} role="grid" aria-label={`${DIFFICULTIES[currentDifficulty].label}扫雷棋盘`}>
                 {room.game.cells.map((cell) => {
                   const numberClass = cell.state === "revealed" && cell.adjacent ? ` number-${cell.adjacent}` : "";
-                  const stateClass = `cell-${cell.state}${cell.exploded ? " exploded" : ""}${cell.wrongFlag ? " wrong" : ""}${numberClass}`;
+                  const previewRow = chordPreviewIndex === null ? -10 : Math.floor(chordPreviewIndex / room.game.width);
+                  const previewCol = chordPreviewIndex === null ? -10 : chordPreviewIndex % room.game.width;
+                  const isChordPreview = chordPreviewIndex !== null
+                    && cell.index !== chordPreviewIndex
+                    && cell.state !== "revealed"
+                    && cell.state !== "flagged"
+                    && Math.abs(cell.row - previewRow) <= 1
+                    && Math.abs(cell.col - previewCol) <= 1;
+                  const stateClass = `cell-${cell.state}${cell.exploded ? " exploded" : ""}${cell.wrongFlag ? " wrong" : ""}${numberClass}${isChordPreview ? " chord-preview" : ""}`;
                   const label = cell.state === "flagged" ? `第 ${cell.row + 1} 行第 ${cell.col + 1} 列，已插旗` : cell.state === "questioned" ? `第 ${cell.row + 1} 行第 ${cell.col + 1} 列，问号标记` : cell.state === "revealed" ? `第 ${cell.row + 1} 行第 ${cell.col + 1} 列，${cell.mine ? "地雷" : `${cell.adjacent ?? 0} 个相邻雷`}` : `第 ${cell.row + 1} 行第 ${cell.col + 1} 列，未揭开`;
                   return (
                     <button
@@ -532,7 +597,14 @@ export function MinefieldApp() {
                       disabled={room.game.status === "won" || room.game.status === "lost"}
                       onClick={() => handleCellClick(cell)}
                       onDoubleClick={(event) => { event.preventDefault(); if (cell.state === "revealed") commitAction({ type: "chord", index: cell.index }); }}
-                      onContextMenu={(event) => { event.preventDefault(); commitAction(nextMarkAction(cell)); }}
+                      onMouseDown={(event) => beginClassicChord(event, cell)}
+                      onMouseUp={(event) => finishClassicChord(event, cell)}
+                      onMouseLeave={() => cancelClassicChord(cell.index)}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        if (chordGestureIndex.current === cell.index || suppressContextMenuIndex.current === cell.index) return;
+                        commitAction(nextMarkAction(cell));
+                      }}
                       onPointerDown={(event) => beginLongPress(event, cell)}
                       onPointerUp={clearLongPress}
                       onPointerCancel={clearLongPress}
@@ -551,7 +623,7 @@ export function MinefieldApp() {
             </div>
           </section>
 
-          <div className="board-help"><span><b>左键</b> 揭开</span><span><b>右键</b> 旗帜 / 问号</span><span><b>双击数字</b> 多开周围</span><span><b>空格</b> 标记</span></div>
+          <div className="board-help"><span><b>左键</b> 揭开</span><span><b>右键</b> 旗帜 / 问号</span><span><b>左右键齐按 / 双击数字</b> 多开周围</span><span><b>空格</b> 标记</span></div>
         </div>
 
         <aside className="side-panel">

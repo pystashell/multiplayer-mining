@@ -757,6 +757,13 @@ a:focus-visible {
 
 .mine-cell.cell-flagged { background: #3e4c4d; }
 .mine-cell.cell-questioned { color: var(--signal); }
+.mine-cell.chord-preview {
+  border-color: #1b2832;
+  background: #1e2c37;
+  transform: translateY(1px);
+  box-shadow: inset 2px 2px 0 rgba(0,0,0,.32);
+  filter: brightness(.92);
+}
 .mine-cell.exploded { background: var(--danger); color: var(--ink); animation: cell-pop 260ms ease-out; }
 .mine-cell.wrong { background: rgba(255, 96, 73, .14); }
 
