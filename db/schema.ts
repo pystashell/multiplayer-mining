@@ -1,4 +1,5 @@
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
+import { check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const rooms = sqliteTable("rooms", {
   code: text("code").primaryKey().notNull(),
@@ -30,4 +31,42 @@ export const rateLimits = sqliteTable("rate_limits", {
   bucket: text("bucket").primaryKey().notNull(),
   count: integer("count").notNull(),
   resetAt: integer("reset_at").notNull(),
-});
+}, (table) => [
+  index("rate_limits_reset_idx").on(table.resetAt),
+]);
+
+export const roomSpectators = sqliteTable("room_spectators", {
+  id: text("id").primaryKey().notNull(),
+  roomCode: text("room_code")
+    .notNull()
+    .references(() => rooms.code, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  tokenHash: text("token_hash").notNull(),
+  seenAt: integer("seen_at").notNull(),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [
+  index("room_spectators_room_idx").on(table.roomCode),
+  uniqueIndex("room_spectators_room_token_idx").on(table.roomCode, table.tokenHash),
+  index("room_spectators_room_seen_idx").on(table.roomCode, table.seenAt),
+]);
+
+export const roomMessages = sqliteTable("room_messages", {
+  id: text("id").primaryKey().notNull(),
+  roomCode: text("room_code")
+    .notNull()
+    .references(() => rooms.code, { onDelete: "cascade" }),
+  senderId: text("sender_id").notNull(),
+  senderName: text("sender_name").notNull(),
+  senderRole: text("sender_role").notNull(),
+  senderSlot: integer("sender_slot"),
+  content: text("content").notNull(),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [
+  check("room_messages_sender_role_check", sql`${table.senderRole} in ('player', 'spectator')`),
+  check(
+    "room_messages_sender_slot_check",
+    sql`(${table.senderRole} = 'player' and ${table.senderSlot} between 1 and 4) or (${table.senderRole} = 'spectator' and ${table.senderSlot} is null)`,
+  ),
+  index("room_messages_room_created_idx").on(table.roomCode, table.createdAt, table.id),
+  index("room_messages_sender_created_idx").on(table.senderId, table.createdAt),
+]);

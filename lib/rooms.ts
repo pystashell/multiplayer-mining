@@ -10,9 +10,15 @@ import {
 
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ROOM_TTL_MS = 24 * 60 * 60 * 1000;
-const ONLINE_WINDOW_MS = 24_000;
+const ONLINE_WINDOW_MS = 30_000;
 const SEEN_WRITE_INTERVAL_MS = 8_000;
 const MAX_ACTIVITY = 12;
+const MAX_SPECTATORS = 20;
+const SPECTATOR_STALE_MS = 60 * 60 * 1000;
+const MAX_CHAT_MESSAGES = 100;
+const RETURNED_CHAT_MESSAGES = 40;
+const CHAT_RATE_LIMIT = 8;
+const CHAT_RATE_WINDOW_MS = 30_000;
 
 const CREATE_ROOMS_SQL = `
   CREATE TABLE IF NOT EXISTS rooms (
@@ -54,6 +60,64 @@ const CREATE_RATE_LIMITS_SQL = `
   ) STRICT
 `;
 
+const CREATE_RATE_LIMITS_RESET_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS rate_limits_reset_idx ON rate_limits (reset_at)
+`;
+
+const CREATE_ROOM_SPECTATORS_SQL = `
+  CREATE TABLE IF NOT EXISTS room_spectators (
+    id TEXT PRIMARY KEY NOT NULL,
+    room_code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    seen_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (room_code) REFERENCES rooms(code) ON DELETE CASCADE
+  ) STRICT
+`;
+
+const CREATE_SPECTATORS_ROOM_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS room_spectators_room_idx ON room_spectators (room_code)
+`;
+
+const CREATE_SPECTATORS_TOKEN_INDEX_SQL = `
+  CREATE UNIQUE INDEX IF NOT EXISTS room_spectators_room_token_idx
+  ON room_spectators (room_code, token_hash)
+`;
+
+const CREATE_SPECTATORS_SEEN_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS room_spectators_room_seen_idx
+  ON room_spectators (room_code, seen_at)
+`;
+
+const CREATE_ROOM_MESSAGES_SQL = `
+  CREATE TABLE IF NOT EXISTS room_messages (
+    id TEXT PRIMARY KEY NOT NULL,
+    room_code TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    sender_name TEXT NOT NULL,
+    sender_role TEXT NOT NULL CHECK(sender_role IN ('player', 'spectator')),
+    sender_slot INTEGER,
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (room_code) REFERENCES rooms(code) ON DELETE CASCADE,
+    CHECK(
+      (sender_role = 'player' AND sender_slot BETWEEN 1 AND 4)
+      OR (sender_role = 'spectator' AND sender_slot IS NULL)
+    )
+  ) STRICT
+`;
+
+const CREATE_MESSAGES_ROOM_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS room_messages_room_created_idx
+  ON room_messages (room_code, created_at, id)
+`;
+
+const CREATE_MESSAGES_SENDER_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS room_messages_sender_created_idx
+  ON room_messages (sender_id, created_at)
+`;
+
 const ROOM_CAPACITY_COLUMNS = [
   ["player3_id", "ALTER TABLE rooms ADD COLUMN player3_id TEXT"],
   ["player3_name", "ALTER TABLE rooms ADD COLUMN player3_name TEXT"],
@@ -89,6 +153,26 @@ type RoomRow = {
   created_at: number;
   updated_at: number;
   expires_at: number;
+};
+
+type SpectatorRow = {
+  id: string;
+  room_code: string;
+  name: string;
+  token_hash: string;
+  seen_at: number;
+  created_at: number;
+};
+
+type MessageRow = {
+  id: string;
+  room_code: string;
+  sender_id: string;
+  sender_name: string;
+  sender_role: "player" | "spectator";
+  sender_slot: number | null;
+  content: string;
+  created_at: number;
 };
 
 export type RoomActivity = {
@@ -133,6 +217,21 @@ export type PublicRoom = {
     online: boolean;
     lastSeenAt: number;
   }>;
+  spectators: Array<{
+    id: string;
+    name: string;
+    online: boolean;
+    lastSeenAt: number;
+  }>;
+  chat: Array<{
+    id: string;
+    senderId: string;
+    senderName: string;
+    senderRole: "player" | "spectator";
+    senderSlot: 1 | 2 | 3 | 4 | null;
+    content: string;
+    createdAt: number;
+  }>;
   activity: RoomActivity[];
   updatedAt: number;
 };
@@ -142,6 +241,15 @@ export type PlayerSession = {
   token: string;
   playerId: string;
   playerName: string;
+  role: "player";
+};
+
+export type SpectatorSession = {
+  code: string;
+  token: string;
+  playerId: string;
+  playerName: string;
+  role: "spectator";
 };
 
 export type WireAction =
@@ -155,7 +263,19 @@ type AuthorizedPlayer = {
   id: string;
   name: string;
   slot: 1 | 2 | 3 | 4;
+  role: "player";
+  seenAt: number;
 };
+
+type AuthorizedSpectator = {
+  id: string;
+  name: string;
+  slot: null;
+  role: "spectator";
+  seenAt: number;
+};
+
+type AuthorizedIdentity = AuthorizedPlayer | AuthorizedSpectator;
 
 type PlayerSlot = AuthorizedPlayer["slot"];
 type JoinableSlot = Exclude<PlayerSlot, 1>;
@@ -216,6 +336,14 @@ export async function ensureRoomSchema() {
         db.prepare(CREATE_ROOMS_SQL),
         db.prepare(CREATE_EXPIRES_INDEX_SQL),
         db.prepare(CREATE_RATE_LIMITS_SQL),
+        db.prepare(CREATE_RATE_LIMITS_RESET_INDEX_SQL),
+        db.prepare(CREATE_ROOM_SPECTATORS_SQL),
+        db.prepare(CREATE_SPECTATORS_ROOM_INDEX_SQL),
+        db.prepare(CREATE_SPECTATORS_TOKEN_INDEX_SQL),
+        db.prepare(CREATE_SPECTATORS_SEEN_INDEX_SQL),
+        db.prepare(CREATE_ROOM_MESSAGES_SQL),
+        db.prepare(CREATE_MESSAGES_ROOM_INDEX_SQL),
+        db.prepare(CREATE_MESSAGES_SENDER_INDEX_SQL),
       ])
       .then(() => ensureRoomCapacityColumns(db))
       .catch((error: unknown) => {
@@ -281,6 +409,26 @@ export async function enforceRateLimit(
   }
 }
 
+async function enforceChatRateLimit(identityId: string) {
+  const now = Date.now();
+  const [, result] = await database().batch<{ count: number; reset_at: number }>([
+    database().prepare("DELETE FROM rate_limits WHERE reset_at <= ?1").bind(now),
+    database().prepare(`
+      INSERT INTO rate_limits (bucket, count, reset_at)
+      VALUES (?1, 1, ?2)
+      ON CONFLICT(bucket) DO UPDATE SET
+        count = CASE WHEN reset_at <= ?3 THEN 1 ELSE count + 1 END,
+        reset_at = CASE WHEN reset_at <= ?3 THEN ?2 ELSE reset_at END
+      RETURNING count, reset_at
+    `).bind(`chat:${identityId}`, now + CHAT_RATE_WINDOW_MS, now),
+  ]);
+  const current = result.results[0];
+  if (current && current.count > CHAT_RATE_LIMIT) {
+    const retrySeconds = Math.max(1, Math.ceil((current.reset_at - now) / 1000));
+    throw new RoomError(`发得太快了，请 ${retrySeconds} 秒后再试。`, 429);
+  }
+}
+
 function normalizeCode(input: string) {
   const code = input.replace(/[^A-Z0-9]/gi, "").toUpperCase();
   if (code.length !== 6) throw new RoomError("房间码应为 6 位。", 400);
@@ -293,6 +441,17 @@ function normalizeName(input: unknown) {
   if (!name) throw new RoomError("请填写你的名字。", 400);
   if ([...name].length > 16) throw new RoomError("名字最多 16 个字。", 400);
   return name;
+}
+
+function normalizeChatContent(input: unknown) {
+  if (typeof input !== "string") throw new RoomError("请输入聊天内容。", 400);
+  const content = input
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, "")
+    .trim();
+  if (!content) throw new RoomError("请输入聊天内容。", 400);
+  if ([...content].length > 240) throw new RoomError("聊天内容最多 240 个字。", 400);
+  return content;
 }
 
 function normalizeDifficulty(input: unknown): Difficulty {
@@ -370,7 +529,7 @@ function publicGame(game: GameState): PublicRoom["game"] {
   };
 }
 
-function toPublicRoom(row: RoomRow, now = Date.now()): PublicRoom {
+async function toPublicRoom(row: RoomRow, now = Date.now()): Promise<PublicRoom> {
   const players: PublicRoom["players"] = [];
   for (const slot of [1, 2, 3, 4] as const) {
     const player = slotRecord(row, slot);
@@ -384,11 +543,51 @@ function toPublicRoom(row: RoomRow, now = Date.now()): PublicRoom {
     });
   }
 
+  const db = database();
+  const [spectatorResult, messageResult] = await Promise.all([
+    db.prepare(`
+      SELECT id, name, seen_at
+      FROM room_spectators
+      WHERE room_code = ?1
+      ORDER BY created_at ASC, id ASC
+    `).bind(row.code).run<Pick<SpectatorRow, "id" | "name" | "seen_at">>(),
+    db.prepare(`
+      SELECT id, room_code, sender_id, sender_name, sender_role, sender_slot, content, created_at
+      FROM (
+        SELECT id, room_code, sender_id, sender_name, sender_role, sender_slot, content, created_at
+        FROM room_messages
+        WHERE room_code = ?1
+        ORDER BY created_at DESC, id DESC
+        LIMIT ${RETURNED_CHAT_MESSAGES}
+      )
+      ORDER BY created_at ASC, id ASC
+    `).bind(row.code).run<MessageRow>(),
+  ]);
+
+  const spectators = spectatorResult.results.map((spectator) => ({
+    id: spectator.id,
+    name: spectator.name,
+    online: now - spectator.seen_at <= ONLINE_WINDOW_MS,
+    lastSeenAt: spectator.seen_at,
+  }));
+
+  const chat = messageResult.results.map((message): PublicRoom["chat"][number] => ({
+    id: message.id,
+    senderId: message.sender_id,
+    senderName: message.sender_name,
+    senderRole: message.sender_role,
+    senderSlot: message.sender_slot as 1 | 2 | 3 | 4 | null,
+    content: message.content,
+    createdAt: message.created_at,
+  }));
+
   return {
     code: row.code,
     version: row.version,
     game: publicGame(parseGame(row)),
     players,
+    spectators,
+    chat,
     activity: parseActivity(row),
     updatedAt: row.updated_at,
   };
@@ -408,22 +607,55 @@ async function authenticate(row: RoomRow, token: string | null) {
   for (const slot of [1, 2, 3, 4] as const) {
     const player = slotRecord(row, slot);
     if (player && hash === player.tokenHash) {
-      return { id: player.id, name: player.name, slot } satisfies AuthorizedPlayer;
+      return {
+        id: player.id,
+        name: player.name,
+        slot,
+        role: "player",
+        seenAt: player.seenAt,
+      } satisfies AuthorizedPlayer;
     }
+  }
+
+  const spectator = await database().prepare(`
+    SELECT id, name, seen_at
+    FROM room_spectators
+    WHERE room_code = ?1 AND token_hash = ?2
+  `).bind(row.code, hash).first<Pick<SpectatorRow, "id" | "name" | "seen_at">>();
+  if (spectator) {
+    return {
+      id: spectator.id,
+      name: spectator.name,
+      slot: null,
+      role: "spectator",
+      seenAt: spectator.seen_at,
+    } satisfies AuthorizedSpectator;
   }
   throw new RoomError("房间身份已失效，请重新加入。", 401);
 }
 
-async function touchPresence(row: RoomRow, player: AuthorizedPlayer) {
+async function touchPresence(row: RoomRow, identity: AuthorizedIdentity) {
   const now = Date.now();
-  const previous = slotRecord(row, player.slot)?.seenAt ?? 0;
-  if (now - previous < SEEN_WRITE_INTERVAL_MS) return row;
-  const column = PRESENCE_COLUMNS[player.slot];
-  await database().prepare(`UPDATE rooms SET ${column} = ?1, expires_at = ?2 WHERE code = ?3`).bind(now, now + ROOM_TTL_MS, row.code).run();
-  if (player.slot === 1) row.host_seen_at = now;
-  else if (player.slot === 2) row.guest_seen_at = now;
-  else if (player.slot === 3) row.player3_seen_at = now;
-  else row.player4_seen_at = now;
+  if (now - identity.seenAt < SEEN_WRITE_INTERVAL_MS) return row;
+  const db = database();
+  if (identity.role === "spectator") {
+    await db.batch([
+      db.prepare("UPDATE room_spectators SET seen_at = ?1 WHERE room_code = ?2 AND id = ?3")
+        .bind(now, row.code, identity.id),
+      db.prepare("UPDATE rooms SET expires_at = ?1 WHERE code = ?2")
+        .bind(now + ROOM_TTL_MS, row.code),
+    ]);
+  } else {
+    const column = PRESENCE_COLUMNS[identity.slot];
+    await db.prepare(`UPDATE rooms SET ${column} = ?1, expires_at = ?2 WHERE code = ?3`)
+      .bind(now, now + ROOM_TTL_MS, row.code)
+      .run();
+    if (identity.slot === 1) row.host_seen_at = now;
+    else if (identity.slot === 2) row.guest_seen_at = now;
+    else if (identity.slot === 3) row.player3_seen_at = now;
+    else row.player4_seen_at = now;
+  }
+  identity.seenAt = now;
   row.expires_at = now + ROOM_TTL_MS;
   return row;
 }
@@ -516,8 +748,8 @@ export async function createRoom(input: { name: unknown; difficulty: unknown }) 
       `).bind(code, JSON.stringify(game), JSON.stringify(activity), playerId, name, tokenHash, now, now + ROOM_TTL_MS).run();
       const row = await readRoom(code);
       return {
-        room: toPublicRoom(row, now),
-        session: { code, token, playerId, playerName: name } satisfies PlayerSession,
+        room: await toPublicRoom(row, now),
+        session: { code, token, playerId, playerName: name, role: "player" } satisfies PlayerSession,
       };
     } catch (error) {
       if (attempt === 7) throw error;
@@ -550,19 +782,109 @@ export async function joinRoom(codeInput: string, input: { name: unknown }) {
     if ((result.meta.changes ?? 0) === 1) {
       const latest = await readRoom(code);
       return {
-        room: toPublicRoom(latest, now),
-        session: { code, token, playerId, playerName: name } satisfies PlayerSession,
+        room: await toPublicRoom(latest, now),
+        session: { code, token, playerId, playerName: name, role: "player" } satisfies PlayerSession,
       };
     }
   }
   throw new RoomError("有人抢先加入了这个房间。", 409);
 }
 
+export async function joinAsSpectator(codeInput: string, input: { name: unknown }) {
+  const code = normalizeCode(codeInput);
+  const name = normalizeName(input.name);
+  await readRoom(code);
+  const db = database();
+  const now = Date.now();
+  const token = randomToken();
+  const tokenHash = await hashToken(token);
+  const playerId = crypto.randomUUID();
+
+  await db.prepare("DELETE FROM room_spectators WHERE room_code = ?1 AND seen_at < ?2")
+    .bind(code, now - SPECTATOR_STALE_MS)
+    .run();
+
+  const inserted = await db.prepare(`
+    INSERT INTO room_spectators (id, room_code, name, token_hash, seen_at, created_at)
+    SELECT ?1, ?2, ?3, ?4, ?5, ?5
+    WHERE (SELECT COUNT(*) FROM room_spectators WHERE room_code = ?2) < ${MAX_SPECTATORS}
+  `).bind(playerId, code, name, tokenHash, now).run();
+  if ((inserted.meta.changes ?? 0) !== 1) {
+    throw new RoomError("这个房间已经有 20 位旁观者了。", 409);
+  }
+
+  await db.prepare(`
+    UPDATE rooms
+    SET version = version + 1, updated_at = ?1, expires_at = ?2
+    WHERE code = ?3
+  `)
+    .bind(now, now + ROOM_TTL_MS, code)
+    .run();
+  const latest = await readRoom(code);
+
+  return {
+    room: await toPublicRoom(latest, now),
+    session: {
+      code,
+      token,
+      playerId,
+      playerName: name,
+      role: "spectator",
+    } satisfies SpectatorSession,
+  };
+}
+
 export async function getRoom(codeInput: string, token: string | null) {
   const row = await readRoom(codeInput);
-  const player = await authenticate(row, token);
-  await touchPresence(row, player);
-  return { room: toPublicRoom(row) };
+  const identity = await authenticate(row, token);
+  await touchPresence(row, identity);
+  return { room: await toPublicRoom(row) };
+}
+
+export async function postRoomMessage(codeInput: string, token: string | null, contentInput: unknown) {
+  const content = normalizeChatContent(contentInput);
+  const row = await readRoom(codeInput);
+  const identity = await authenticate(row, token);
+  await touchPresence(row, identity);
+  await enforceChatRateLimit(identity.id);
+
+  const db = database();
+  const now = Date.now();
+  await db.batch([
+    db.prepare(`
+      INSERT INTO room_messages (
+        id, room_code, sender_id, sender_name, sender_role, sender_slot, content, created_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+    `).bind(
+      crypto.randomUUID(),
+      row.code,
+      identity.id,
+      identity.name,
+      identity.role,
+      identity.slot,
+      content,
+      now,
+    ),
+    db.prepare(`
+      DELETE FROM room_messages
+      WHERE room_code = ?1
+        AND id NOT IN (
+          SELECT id
+          FROM room_messages
+          WHERE room_code = ?1
+          ORDER BY created_at DESC, id DESC
+          LIMIT ${MAX_CHAT_MESSAGES}
+        )
+    `).bind(row.code),
+    db.prepare(`
+      UPDATE rooms
+      SET version = version + 1, updated_at = ?1, expires_at = ?2
+      WHERE code = ?3
+    `).bind(now, now + ROOM_TTL_MS, row.code),
+  ]);
+
+  const latest = await readRoom(row.code);
+  return { room: await toPublicRoom(latest, now) };
 }
 
 export async function applyRoomAction(codeInput: string, token: string | null, wireAction: WireAction) {
@@ -571,12 +893,14 @@ export async function applyRoomAction(codeInput: string, token: string | null, w
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const row = await readRoom(codeInput);
-    const player = await authenticate(row, token);
+    const identity = await authenticate(row, token);
+    if (identity.role === "spectator") throw new RoomError("旁观者不能操作雷区。", 403);
+    const player = identity;
     const before = parseGame(row);
     const translated = translateAction(wireAction, before);
     const after = reduceGameAction(before, translated.engine, { actorId: player.id });
     await touchPresence(row, player);
-    if (after === before) return { room: toPublicRoom(row) };
+    if (after === before) return { room: await toPublicRoom(row) };
 
     const activityType = actionActivity(before, after, wireAction, translated.detail);
     const activity = [newActivity(player, activityType.type, activityType.detail), ...parseActivity(row)].slice(0, MAX_ACTIVITY);
@@ -590,7 +914,7 @@ export async function applyRoomAction(codeInput: string, token: string | null, w
 
     if ((result.meta.changes ?? 0) === 1) {
       const latest = await readRoom(row.code);
-      return { room: toPublicRoom(latest, now) };
+      return { room: await toPublicRoom(latest, now) };
     }
   }
 

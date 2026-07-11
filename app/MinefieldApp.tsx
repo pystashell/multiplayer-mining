@@ -38,6 +38,23 @@ type RoomPlayer = {
   lastSeenAt: number;
 };
 
+type RoomSpectator = {
+  id: string;
+  name: string;
+  online: boolean;
+  lastSeenAt: number;
+};
+
+type ChatMessage = {
+  id: string;
+  senderId: string;
+  senderName: string;
+  senderRole: "player" | "spectator";
+  senderSlot: 1 | 2 | 3 | 4 | null;
+  content: string;
+  createdAt: number;
+};
+
 type Activity = {
   id: string;
   playerId: string;
@@ -52,6 +69,8 @@ type Room = {
   version: number;
   game: PublicGame;
   players: RoomPlayer[];
+  spectators?: RoomSpectator[];
+  chat?: ChatMessage[];
   activity: Activity[];
   updatedAt: number;
 };
@@ -61,6 +80,7 @@ type Session = {
   token: string;
   playerId: string;
   playerName: string;
+  role?: "player" | "spectator";
 };
 
 type GameAction =
@@ -145,6 +165,8 @@ export function MinefieldApp() {
   const [notice, setNotice] = useState("");
   const [connected, setConnected] = useState(true);
   const [tapMode, setTapMode] = useState<"reveal" | "mark">("reveal");
+  const [chatDraft, setChatDraft] = useState("");
+  const [sendingChat, setSendingChat] = useState(false);
   const [chordPreviewIndex, setChordPreviewIndex] = useState<number | null>(null);
   const [now, setNow] = useState(0);
   const roomRef = useRef<Room | null>(null);
@@ -155,6 +177,7 @@ export function MinefieldApp() {
   const chordGestureIndex = useRef<number | null>(null);
   const suppressContextMenuIndex = useRef<number | null>(null);
   const suppressContextMenuTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chatListRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     roomRef.current = room;
@@ -216,13 +239,14 @@ export function MinefieldApp() {
     let pollTimer = 0;
     let failures = 0;
     let running = false;
+    const pollInterval = session.role === "spectator" ? 2_000 : 900;
 
     const schedule = (delay: number) => {
       window.clearTimeout(pollTimer);
       pollTimer = window.setTimeout(async () => {
         if (cancelled) return;
         if (running) {
-          schedule(900);
+          schedule(pollInterval);
           return;
         }
         running = true;
@@ -231,7 +255,7 @@ export function MinefieldApp() {
           failures = ok ? 0 : Math.min(failures + 1, 3);
         }
         running = false;
-        if (!cancelled) schedule(Math.min(6_000, 900 * (2 ** failures)));
+        if (!cancelled) schedule(Math.min(8_000, pollInterval * (2 ** failures)));
       }, delay);
     };
 
@@ -239,7 +263,7 @@ export function MinefieldApp() {
       if (document.visibilityState === "visible") schedule(0);
     };
 
-    schedule(900);
+    schedule(pollInterval);
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {
       cancelled = true;
@@ -247,6 +271,17 @@ export function MinefieldApp() {
       document.removeEventListener("visibilitychange", handleVisibility);
     };
   }, [fetchRoom, session]);
+
+  const latestChatId = room?.chat?.at(-1)?.id;
+
+  useEffect(() => {
+    if (!latestChatId || !chatListRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      const list = chatListRef.current;
+      if (list) list.scrollTop = list.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [latestChatId]);
 
   useEffect(() => {
     if (room?.game.status !== "playing") return;
@@ -285,6 +320,8 @@ export function MinefieldApp() {
     sessionRef.current = next;
     actionQueue.current = Promise.resolve();
     setPausedSession(null);
+    setChatDraft("");
+    setSendingChat(false);
     setSession(next);
   };
 
@@ -310,8 +347,7 @@ export function MinefieldApp() {
     }
   };
 
-  const joinRoom = async (event: FormEvent) => {
-    event.preventDefault();
+  const enterRoom = async (op: "join" | "spectate") => {
     const cleanName = name.trim();
     const cleanCode = joinCode.replace(/[^a-z0-9]/gi, "").toUpperCase();
     if (!cleanName) return setError("先留个名字，不然队友没法甩锅。 ");
@@ -322,16 +358,22 @@ export function MinefieldApp() {
       const response = await fetch(`/api/rooms/${cleanCode}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ op: "join", name: cleanName }),
+        body: JSON.stringify({ op, name: cleanName }),
       });
       const payload = (await readJson(response)) as { room: Room; session: Session };
       persistSession(payload.session);
       acceptRoom(payload.room);
     } catch (joinError) {
-      setError(displayError(joinError));
+      const message = displayError(joinError);
+      setError(op === "join" && /满|full/i.test(message) ? `${message} 还可以点“旁观”进入房间。` : message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const joinRoom = (event: FormEvent) => {
+    event.preventDefault();
+    void enterRoom("join");
   };
 
   const leaveRoom = () => {
@@ -341,6 +383,8 @@ export function MinefieldApp() {
     setSession(null);
     setRoom(null);
     setJoinCode("");
+    setChatDraft("");
+    setSendingChat(false);
     setError("");
   };
 
@@ -353,7 +397,7 @@ export function MinefieldApp() {
 
   const commitAction = useCallback((action: GameAction) => {
     const activeSession = sessionRef.current;
-    if (!activeSession) return;
+    if (!activeSession || activeSession.role === "spectator") return;
     actionQueue.current = actionQueue.current.then(async () => {
       try {
         const response = await fetch(`/api/rooms/${activeSession.code}`, {
@@ -377,6 +421,35 @@ export function MinefieldApp() {
       }
     });
   }, [acceptRoom, fetchRoom]);
+
+  const sendChat = async (event: FormEvent) => {
+    event.preventDefault();
+    const message = chatDraft.trim();
+    const activeSession = sessionRef.current;
+    if (!activeSession || !message || sendingChat) return;
+    setSendingChat(true);
+    try {
+      const response = await fetch(`/api/rooms/${activeSession.code}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-player-token": activeSession.token,
+        },
+        body: JSON.stringify({ op: "chat", content: message }),
+      });
+      const payload = (await readJson(response)) as { room: Room };
+      if (sessionRef.current?.token !== activeSession.token) return;
+      setChatDraft("");
+      acceptRoom(payload.room);
+      setConnected(true);
+      setError("");
+    } catch (chatError) {
+      if (sessionRef.current?.token !== activeSession.token) return;
+      setError(displayError(chatError));
+    } finally {
+      if (sessionRef.current?.token === activeSession.token) setSendingChat(false);
+    }
+  };
 
   const copyInvite = async () => {
     if (!room) return;
@@ -463,7 +536,9 @@ export function MinefieldApp() {
   const status = room ? statusCopy(room.game, room.players) : null;
   const seconds = room ? secondsFor(room.game, now) : 0;
   const currentDifficulty = room?.game.difficulty ?? difficulty;
+  const isSpectator = (session?.role ?? "player") === "spectator";
   const me = room?.players.find((player) => player.id === session?.playerId);
+  const spectatorMe = room?.spectators?.find((spectator) => spectator.id === session?.playerId);
   const remainingSafe = room ? room.game.width * room.game.height - room.game.mines - room.game.revealed : 0;
   const friendship = room ? Math.max(8, Math.round(100 - (remainingSafe / Math.max(1, room.game.width * room.game.height - room.game.mines)) * 52 - (room.game.status === "lost" ? 40 : 0))) : 72;
 
@@ -480,14 +555,14 @@ export function MinefieldApp() {
             <span className="brand-mark" aria-hidden="true">✹</span>
             <span>同雷共苦</span>
           </a>
-          <span className="topbar-note"><i /> 最多四人实时扫雷</span>
+          <span className="topbar-note"><i /> 最多四人实时扫雷 · 好友围观</span>
         </header>
 
         <section className="lobby-grid">
           <div className="hero-copy">
             <p className="kicker">LIVE CO-OP MINESWEEPER</p>
             <h1>一块雷区，<br /><em>全队一起背锅。</em></h1>
-            <p className="hero-lede">经典扫雷的全部紧张感，再加上最多三个会乱插旗的朋友。双击多开、右键标记、首击安全——以及全程可追溯的友谊事故现场。</p>
+            <p className="hero-lede">经典扫雷的全部紧张感，再加上最多三个会乱插旗的朋友和一群在线围观群众。双击多开、右键标记、首击安全——以及一个随时可以甩锅的聊天区。</p>
 
             <div className="pressure-card" aria-label="血压预警">
               <div className="pressure-head"><span>血压预警</span><strong>偏高</strong></div>
@@ -496,7 +571,7 @@ export function MinefieldApp() {
             </div>
 
             <div className="feature-tape" aria-label="游戏特性">
-              <span>同盘实时同步</span><span>经典三态标记</span><span>手机长按插旗</span>
+              <span>同盘实时同步</span><span>玩家与旁观聊天</span><span>手机长按插旗</span>
             </div>
           </div>
 
@@ -507,7 +582,7 @@ export function MinefieldApp() {
             </div>
             {pausedSession && (
               <button className="resume-room" type="button" onClick={resumeRoom}>
-                <span>继续刚才的房间</span><strong>{pausedSession.code}</strong><b aria-hidden="true">→</b>
+                <span>{pausedSession.role === "spectator" ? "继续旁观" : "继续刚才的房间"}</span><strong>{pausedSession.code}</strong><b aria-hidden="true">→</b>
               </button>
             )}
             <label className="field-label" htmlFor="player-name">你的名字</label>
@@ -530,13 +605,16 @@ export function MinefieldApp() {
             <form onSubmit={joinRoom} className="join-row">
               <label className="sr-only" htmlFor="room-code">6 位房间码</label>
               <input id="room-code" className="text-input code-input" value={joinCode} maxLength={6} onChange={(event) => setJoinCode(event.target.value.replace(/[^a-z0-9]/gi, "").toUpperCase())} placeholder="房间码" autoCapitalize="characters" />
-              <button className="secondary-button" disabled={loading} type="submit">加入房间</button>
+              <div className="join-actions">
+                <button className="secondary-button" disabled={loading} type="submit">加入游戏</button>
+                <button className="spectate-button" disabled={loading} type="button" onClick={() => void enterRoom("spectate")}>旁观</button>
+              </div>
             </form>
             {error && <p className="form-error" role="alert">{error}</p>}
           </div>
         </section>
 
-        <footer className="site-footer"><span>右键插旗 · 再右键问号 · 双击数字多开</span><span>NO FRIENDSHIPS WERE GUARANTEED</span></footer>
+        <footer className="site-footer"><span>四人下场 · 好友旁观 · 全员聊天</span><span>NO FRIENDSHIPS WERE GUARANTEED</span></footer>
       </main>
     );
   }
@@ -551,13 +629,17 @@ export function MinefieldApp() {
           <span>房间</span><strong>{room.code}</strong>
           <button onClick={copyInvite}>复制邀请</button>
         </div>
-        <span className={connected ? "connection-state online" : "connection-state"}><i />{connected ? "同步中" : "重连中"}</span>
+        <span className={connected ? "connection-state online" : "connection-state"}><i />{isSpectator ? (connected ? "旁观中" : "重连中") : (connected ? "同步中" : "重连中")}</span>
       </header>
 
       <section className="game-layout">
         <div className="board-column">
           <div className="game-status-line">
-            <div><p>{status?.eyebrow}</p><h1>{status?.title}</h1><span>{status?.body}</span></div>
+            <div>
+              <p>{isSpectator ? "SPECTATING" : status?.eyebrow}</p>
+              <h1>{isSpectator ? "前排围观友谊危机" : status?.title}</h1>
+              <span>{isSpectator ? `你以旁观者身份进入，棋盘只读；可以在聊天区和大家交流。` : status?.body}</span>
+            </div>
             <div className="friendship-meter">
               <span>友谊耐久</span>
               <strong>{friendship}%</strong>
@@ -568,7 +650,7 @@ export function MinefieldApp() {
           <section className={`mine-console status-${room.game.status}`} aria-label="扫雷棋盘">
             <div className="classic-display">
               <div className="digit-box"><small>剩余雷数</small><strong>{formatCounter(room.game.mines - room.game.flags)}</strong></div>
-              <button className="face-button" onClick={() => commitAction({ type: "restart" })} aria-label="重新开始">
+              <button className="face-button" onClick={() => commitAction({ type: "restart" })} aria-label={isSpectator ? "旁观模式，不能重新开始" : "重新开始"} disabled={isSpectator}>
                 {room.game.status === "lost" ? "×_×" : room.game.status === "won" ? "^‿^" : room.game.status === "playing" ? "•_•" : "•‿•"}
               </button>
               <div className="digit-box align-right"><small>用时</small><strong>{formatCounter(seconds)}</strong></div>
@@ -594,7 +676,7 @@ export function MinefieldApp() {
                       className={`mine-cell ${stateClass}`}
                       role="gridcell"
                       aria-label={label}
-                      disabled={room.game.status === "won" || room.game.status === "lost"}
+                      disabled={isSpectator || room.game.status === "won" || room.game.status === "lost"}
                       onClick={() => handleCellClick(cell)}
                       onDoubleClick={(event) => { event.preventDefault(); if (cell.state === "revealed") commitAction({ type: "chord", index: cell.index }); }}
                       onMouseDown={(event) => beginClassicChord(event, cell)}
@@ -616,14 +698,18 @@ export function MinefieldApp() {
               </div>
             </div>
 
-            <div className="mobile-mode" role="group" aria-label="触屏操作模式">
-              <button className={tapMode === "reveal" ? "active" : ""} onClick={() => setTapMode("reveal")}>轻触排雷</button>
-              <button className={tapMode === "mark" ? "active" : ""} onClick={() => setTapMode("mark")}>轻触标记</button>
-              <span>也可长按插旗</span>
-            </div>
+            {!isSpectator && (
+              <div className="mobile-mode" role="group" aria-label="触屏操作模式">
+                <button className={tapMode === "reveal" ? "active" : ""} onClick={() => setTapMode("reveal")}>轻触排雷</button>
+                <button className={tapMode === "mark" ? "active" : ""} onClick={() => setTapMode("mark")}>轻触标记</button>
+                <span>也可长按插旗</span>
+              </div>
+            )}
           </section>
 
-          <div className="board-help"><span><b>左键</b> 揭开</span><span><b>右键</b> 旗帜 / 问号</span><span><b>左右键齐按 / 双击数字</b> 多开周围</span><span><b>空格</b> 标记</span></div>
+          <div className="board-help">
+            {isSpectator ? <span><b>旁观模式</b> 棋盘实时同步但不可操作，欢迎在聊天区指挥。</span> : <><span><b>左键</b> 揭开</span><span><b>右键</b> 旗帜 / 问号</span><span><b>左右键齐按 / 双击数字</b> 多开周围</span><span><b>空格</b> 标记</span></>}
+          </div>
         </div>
 
         <aside className="side-panel">
@@ -641,6 +727,58 @@ export function MinefieldApp() {
                 <button className="empty-player" key={slot} onClick={copyInvite}><span>+</span><div><strong>等待队友</strong><small>点击复制邀请</small></div></button>
               );
             })}
+            <div className="spectator-heading">
+              <span>旁观席</span><small>{room.spectators?.length ?? 0} 人</small>
+            </div>
+            {room.spectators?.length ? (
+              <div className="spectator-list">
+                {room.spectators.map((spectator) => (
+                  <div className="spectator-card" key={spectator.id}>
+                    <span className="spectator-avatar" aria-hidden="true">◉</span>
+                    <strong>{spectator.name}{spectator.id === spectatorMe?.id ? "（你）" : ""}</strong>
+                    <i className={spectator.online ? "online" : ""} title={spectator.online ? "正在旁观" : "暂时离线"} />
+                  </div>
+                ))}
+              </div>
+            ) : <p className="empty-spectators">还没有围观群众。</p>}
+          </section>
+
+          <section className="panel-section chat-section">
+            <div className="panel-heading"><span>房间聊天</span><small>{isSpectator ? "旁观也能聊" : "ALL HANDS"}</small></div>
+            <div className="chat-list" ref={chatListRef} aria-live="polite" aria-label="房间聊天记录">
+              {room.chat?.length ? room.chat.map((message) => {
+                const slotClass = message.senderRole === "player" && message.senderSlot ? ` chat-player-${message.senderSlot}` : " chat-spectator";
+                const isMine = message.senderId === session.playerId;
+                return (
+                  <article className={`chat-message${slotClass}${isMine ? " mine" : ""}`} key={message.id}>
+                    <div className="chat-message-meta">
+                      <strong>{message.senderName}{isMine ? "（你）" : ""}</strong>
+                      <span>{message.senderRole === "spectator" ? "旁观" : `${message.senderSlot ?? "?"} 号玩家`}</span>
+                      <time>{new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>
+                    </div>
+                    <p>{message.content}</p>
+                  </article>
+                );
+              }) : <div className="empty-chat"><span aria-hidden="true">…</span><p>还没人开口。先发一句“这格肯定安全”。</p></div>}
+            </div>
+            <form className="chat-form" onSubmit={sendChat}>
+              <label className="sr-only" htmlFor="chat-message">发送聊天消息</label>
+              <textarea
+                id="chat-message"
+                value={chatDraft}
+                maxLength={240}
+                rows={2}
+                onChange={(event) => setChatDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    event.currentTarget.form?.requestSubmit();
+                  }
+                }}
+                placeholder={isSpectator ? "给场上选手一点建议…" : "和队友商量，或提前甩锅…"}
+              />
+              <div><small>{chatDraft.length}/240</small><button type="submit" disabled={!chatDraft.trim() || sendingChat}>{sendingChat ? "发送中" : "发送"}</button></div>
+            </form>
           </section>
 
           <section className="panel-section activity-section">
@@ -659,13 +797,19 @@ export function MinefieldApp() {
           </section>
 
           <section className="panel-section settings-section">
-            <div className="panel-heading"><span>本局设置</span></div>
-            <label htmlFor="game-difficulty">难度</label>
-            <select id="game-difficulty" value={currentDifficulty} onChange={(event) => commitAction({ type: "changeDifficulty", difficulty: event.target.value as Difficulty })}>
-              {(Object.keys(DIFFICULTIES) as Difficulty[]).map((key) => <option value={key} key={key}>{DIFFICULTIES[key].label} · {DIFFICULTIES[key].meta}</option>)}
-            </select>
-            <button className="restart-button" onClick={() => commitAction({ type: "restart" })}>重新布置雷区</button>
-            <button className="leave-button" onClick={leaveRoom}>暂时离开房间</button>
+            <div className="panel-heading"><span>{isSpectator ? "旁观状态" : "本局设置"}</span>{isSpectator && <small>READ ONLY</small>}</div>
+            {isSpectator ? (
+              <p className="spectator-note">你正在以 <strong>{spectatorMe?.name ?? session.playerName}</strong> 的身份旁观。棋盘操作与本局设置已锁定，聊天仍可使用。</p>
+            ) : (
+              <>
+                <label htmlFor="game-difficulty">难度</label>
+                <select id="game-difficulty" value={currentDifficulty} onChange={(event) => commitAction({ type: "changeDifficulty", difficulty: event.target.value as Difficulty })}>
+                  {(Object.keys(DIFFICULTIES) as Difficulty[]).map((key) => <option value={key} key={key}>{DIFFICULTIES[key].label} · {DIFFICULTIES[key].meta}</option>)}
+                </select>
+                <button className="restart-button" onClick={() => commitAction({ type: "restart" })}>重新布置雷区</button>
+              </>
+            )}
+            <button className="leave-button" onClick={leaveRoom}>{isSpectator ? "离开旁观席" : "暂时离开房间"}</button>
           </section>
         </aside>
       </section>

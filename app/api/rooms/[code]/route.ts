@@ -1,4 +1,13 @@
-import { applyRoomAction, enforceRateLimit, getRoom, joinRoom, RoomError, type WireAction } from "../../../../lib/rooms";
+import {
+  applyRoomAction,
+  enforceRateLimit,
+  getRoom,
+  joinAsSpectator,
+  joinRoom,
+  postRoomMessage,
+  RoomError,
+  type WireAction,
+} from "../../../../lib/rooms";
 
 export const dynamic = "force-dynamic";
 
@@ -37,10 +46,25 @@ export async function POST(request: Request, context: RouteContext) {
   try {
     verifyOrigin(request);
     const { code } = await context.params;
-    const payload = await request.json() as { op?: string; name?: unknown; action?: WireAction };
+    const payload = await request.json() as {
+      op?: string;
+      name?: unknown;
+      content?: unknown;
+      message?: unknown;
+      action?: WireAction;
+    };
     if (payload.op === "join") {
       await enforceRateLimit(request, "join-room", 30, 10 * 60 * 1000);
       const result = await joinRoom(code, { name: payload.name });
+      return Response.json(result, { status: 201, headers: noStore });
+    }
+    if (payload.op === "spectate") {
+      await enforceRateLimit(request, "join-room", 30, 10 * 60 * 1000);
+      const result = await joinAsSpectator(code, { name: payload.name });
+      return Response.json(result, { status: 201, headers: noStore });
+    }
+    if (payload.op === "chat") {
+      const result = await postRoomMessage(code, tokenFrom(request), payload.message ?? payload.content);
       return Response.json(result, { status: 201, headers: noStore });
     }
     if (payload.op === "action" && payload.action) {
