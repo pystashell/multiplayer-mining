@@ -33,7 +33,7 @@ type PublicGame = {
 type RoomPlayer = {
   id: string;
   name: string;
-  slot: 1 | 2;
+  slot: 1 | 2 | 3 | 4;
   online: boolean;
   lastSeenAt: number;
 };
@@ -102,8 +102,8 @@ function secondsFor(game: PublicGame, now: number) {
 function statusCopy(game: PublicGame, players: RoomPlayer[]) {
   if (game.status === "won") return { eyebrow: "CLEAR", title: "你们居然还在做朋友", body: "雷区清空，友谊暂时安全。" };
   if (game.status === "lost") return { eyebrow: "BOOM", title: "有人动了不该动的格子", body: "别急着甩锅，活动记录都记着呢。" };
-  if (game.status === "playing") return { eyebrow: "LIVE", title: "全员屏住呼吸", body: players.length < 2 ? "先扫着，队友随时可以加入。" : "同一块棋盘，任何一步都会同步。" };
-  return { eyebrow: "READY", title: players.length < 2 ? "等队友，也可以先开" : "两位都到齐了", body: "第一次揭开必定安全，计时也从那时开始。" };
+  if (game.status === "playing") return { eyebrow: "LIVE", title: "全员屏住呼吸", body: players.length < 2 ? "先扫着，队友随时可以加入。" : `${players.length} 人同扫一块棋盘，任何一步都会同步。` };
+  return { eyebrow: "READY", title: players.length < 2 ? "等队友，也可以先开" : players.length >= 4 ? "全员到齐，准备互相甩锅" : `${players.length} 位已到场，随时开扫`, body: "第一次揭开必定安全，计时也从那时开始。" };
 }
 
 function activityCopy(item: Activity) {
@@ -480,14 +480,14 @@ export function MinefieldApp() {
             <span className="brand-mark" aria-hidden="true">✹</span>
             <span>同雷共苦</span>
           </a>
-          <span className="topbar-note"><i /> 双人实时扫雷</span>
+          <span className="topbar-note"><i /> 最多四人实时扫雷</span>
         </header>
 
         <section className="lobby-grid">
           <div className="hero-copy">
             <p className="kicker">LIVE CO-OP MINESWEEPER</p>
-            <h1>一块雷区，<br /><em>两个人背锅。</em></h1>
-            <p className="hero-lede">经典扫雷的全部紧张感，再加一个会乱插旗的朋友。双击多开、右键标记、首击安全——以及全程可追溯的友谊事故现场。</p>
+            <h1>一块雷区，<br /><em>全队一起背锅。</em></h1>
+            <p className="hero-lede">经典扫雷的全部紧张感，再加上最多三个会乱插旗的朋友。双击多开、右键标记、首击安全——以及全程可追溯的友谊事故现场。</p>
 
             <div className="pressure-card" aria-label="血压预警">
               <div className="pressure-head"><span>血压预警</span><strong>偏高</strong></div>
@@ -628,8 +628,8 @@ export function MinefieldApp() {
 
         <aside className="side-panel">
           <section className="panel-section players-section">
-            <div className="panel-heading"><span>雷区成员</span><small>{room.players.length}/2</small></div>
-            {[1, 2].map((slot) => {
+            <div className="panel-heading"><span>雷区成员</span><small>{room.players.length}/4</small></div>
+            {([1, 2, 3, 4] as const).map((slot) => {
               const player = room.players.find((candidate) => candidate.slot === slot);
               return player ? (
                 <div className={`player-card player-${slot}`} key={slot}>
@@ -646,12 +646,15 @@ export function MinefieldApp() {
           <section className="panel-section activity-section">
             <div className="panel-heading"><span>事故记录</span><small>LIVE</small></div>
             <div className="activity-list">
-              {room.activity.length ? room.activity.slice(0, 7).map((item) => (
-                <div className="activity-item" key={item.id}>
-                  <i className={item.playerId === room.players[0]?.id ? "p1" : "p2"} />
-                  <p><strong>{item.playerName}</strong>{activityCopy(item)}<time>{new Date(item.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time></p>
-                </div>
-              )) : <p className="empty-activity">还没有事故。很快就会有的。</p>}
+              {room.activity.length ? room.activity.slice(0, 7).map((item) => {
+                const actorSlot = room.players.find((player) => player.id === item.playerId)?.slot;
+                return (
+                  <div className="activity-item" key={item.id}>
+                    <i className={actorSlot ? `p${actorSlot}` : undefined} aria-hidden="true" />
+                    <p><strong>{item.playerName}</strong>{activityCopy(item)}<time>{new Date(item.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time></p>
+                  </div>
+                );
+              }) : <p className="empty-activity">还没有事故。很快就会有的。</p>}
             </div>
           </section>
 

@@ -28,6 +28,14 @@ const CREATE_ROOMS_SQL = `
     guest_name TEXT,
     guest_token_hash TEXT,
     guest_seen_at INTEGER,
+    player3_id TEXT,
+    player3_name TEXT,
+    player3_token_hash TEXT,
+    player3_seen_at INTEGER,
+    player4_id TEXT,
+    player4_name TEXT,
+    player4_token_hash TEXT,
+    player4_seen_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
@@ -46,6 +54,17 @@ const CREATE_RATE_LIMITS_SQL = `
   ) STRICT
 `;
 
+const ROOM_CAPACITY_COLUMNS = [
+  ["player3_id", "ALTER TABLE rooms ADD COLUMN player3_id TEXT"],
+  ["player3_name", "ALTER TABLE rooms ADD COLUMN player3_name TEXT"],
+  ["player3_token_hash", "ALTER TABLE rooms ADD COLUMN player3_token_hash TEXT"],
+  ["player3_seen_at", "ALTER TABLE rooms ADD COLUMN player3_seen_at INTEGER"],
+  ["player4_id", "ALTER TABLE rooms ADD COLUMN player4_id TEXT"],
+  ["player4_name", "ALTER TABLE rooms ADD COLUMN player4_name TEXT"],
+  ["player4_token_hash", "ALTER TABLE rooms ADD COLUMN player4_token_hash TEXT"],
+  ["player4_seen_at", "ALTER TABLE rooms ADD COLUMN player4_seen_at INTEGER"],
+] as const;
+
 type RoomRow = {
   code: string;
   version: number;
@@ -59,6 +78,14 @@ type RoomRow = {
   guest_name: string | null;
   guest_token_hash: string | null;
   guest_seen_at: number | null;
+  player3_id: string | null;
+  player3_name: string | null;
+  player3_token_hash: string | null;
+  player3_seen_at: number | null;
+  player4_id: string | null;
+  player4_name: string | null;
+  player4_token_hash: string | null;
+  player4_seen_at: number | null;
   created_at: number;
   updated_at: number;
   expires_at: number;
@@ -102,7 +129,7 @@ export type PublicRoom = {
   players: Array<{
     id: string;
     name: string;
-    slot: 1 | 2;
+    slot: 1 | 2 | 3 | 4;
     online: boolean;
     lastSeenAt: number;
   }>;
@@ -127,7 +154,30 @@ export type WireAction =
 type AuthorizedPlayer = {
   id: string;
   name: string;
-  slot: 1 | 2;
+  slot: 1 | 2 | 3 | 4;
+};
+
+type PlayerSlot = AuthorizedPlayer["slot"];
+type JoinableSlot = Exclude<PlayerSlot, 1>;
+
+type SlotRecord = {
+  id: string;
+  name: string;
+  tokenHash: string;
+  seenAt: number;
+};
+
+const JOIN_SLOT_COLUMNS = {
+  2: { id: "guest_id", name: "guest_name", token: "guest_token_hash", seen: "guest_seen_at" },
+  3: { id: "player3_id", name: "player3_name", token: "player3_token_hash", seen: "player3_seen_at" },
+  4: { id: "player4_id", name: "player4_name", token: "player4_token_hash", seen: "player4_seen_at" },
+} as const;
+
+const PRESENCE_COLUMNS: Record<PlayerSlot, string> = {
+  1: "host_seen_at",
+  2: "guest_seen_at",
+  3: "player3_seen_at",
+  4: "player4_seen_at",
 };
 
 export class RoomError extends Error {
@@ -143,6 +193,21 @@ function database() {
   return env.DB;
 }
 
+async function ensureRoomCapacityColumns(db: D1Database) {
+  const current = await db.prepare("PRAGMA table_info(rooms)").run<{ name: string }>();
+  const existing = new Set(current.results.map((column) => column.name));
+  const missing = ROOM_CAPACITY_COLUMNS.filter(([name]) => !existing.has(name));
+  if (missing.length === 0) return;
+
+  try {
+    await db.batch(missing.map(([, sql]) => db.prepare(sql)));
+  } catch (error) {
+    const verified = await db.prepare("PRAGMA table_info(rooms)").run<{ name: string }>();
+    const finalColumns = new Set(verified.results.map((column) => column.name));
+    if (!ROOM_CAPACITY_COLUMNS.every(([name]) => finalColumns.has(name))) throw error;
+  }
+}
+
 export async function ensureRoomSchema() {
   if (!schemaReady) {
     const db = database();
@@ -152,13 +217,40 @@ export async function ensureRoomSchema() {
         db.prepare(CREATE_EXPIRES_INDEX_SQL),
         db.prepare(CREATE_RATE_LIMITS_SQL),
       ])
-      .then(() => undefined)
+      .then(() => ensureRoomCapacityColumns(db))
       .catch((error: unknown) => {
         schemaReady = null;
         throw error;
       });
   }
   return schemaReady;
+}
+
+function slotRecord(row: RoomRow, slot: PlayerSlot): SlotRecord | null {
+  if (slot === 1) {
+    return {
+      id: row.host_id,
+      name: row.host_name,
+      tokenHash: row.host_token_hash,
+      seenAt: row.host_seen_at,
+    };
+  }
+
+  const values: [string | null, string | null, string | null, number | null] = slot === 2
+    ? [row.guest_id, row.guest_name, row.guest_token_hash, row.guest_seen_at]
+    : slot === 3
+      ? [row.player3_id, row.player3_name, row.player3_token_hash, row.player3_seen_at]
+      : [row.player4_id, row.player4_name, row.player4_token_hash, row.player4_seen_at];
+  const [id, name, tokenHash, seenAt] = values;
+  if (!id || !name || !tokenHash || seenAt === null) return null;
+  return { id, name, tokenHash, seenAt };
+}
+
+function nextOpenSlot(row: RoomRow): JoinableSlot | null {
+  if (!row.guest_id) return 2;
+  if (!row.player3_id) return 3;
+  if (!row.player4_id) return 4;
+  return null;
 }
 
 export async function enforceRateLimit(
@@ -279,22 +371,16 @@ function publicGame(game: GameState): PublicRoom["game"] {
 }
 
 function toPublicRoom(row: RoomRow, now = Date.now()): PublicRoom {
-  const players: PublicRoom["players"] = [
-    {
-      id: row.host_id,
-      name: row.host_name,
-      slot: 1,
-      online: now - row.host_seen_at <= ONLINE_WINDOW_MS,
-      lastSeenAt: row.host_seen_at,
-    },
-  ];
-  if (row.guest_id && row.guest_name && row.guest_seen_at !== null) {
+  const players: PublicRoom["players"] = [];
+  for (const slot of [1, 2, 3, 4] as const) {
+    const player = slotRecord(row, slot);
+    if (!player) continue;
     players.push({
-      id: row.guest_id,
-      name: row.guest_name,
-      slot: 2,
-      online: now - row.guest_seen_at <= ONLINE_WINDOW_MS,
-      lastSeenAt: row.guest_seen_at,
+      id: player.id,
+      name: player.name,
+      slot,
+      online: now - player.seenAt <= ONLINE_WINDOW_MS,
+      lastSeenAt: player.seenAt,
     });
   }
 
@@ -319,21 +405,25 @@ async function readRoom(codeInput: string) {
 async function authenticate(row: RoomRow, token: string | null) {
   if (!token || token.length > 128) throw new RoomError("房间身份已失效，请重新加入。", 401);
   const hash = await hashToken(token);
-  if (hash === row.host_token_hash) return { id: row.host_id, name: row.host_name, slot: 1 } satisfies AuthorizedPlayer;
-  if (row.guest_token_hash && hash === row.guest_token_hash && row.guest_id && row.guest_name) {
-    return { id: row.guest_id, name: row.guest_name, slot: 2 } satisfies AuthorizedPlayer;
+  for (const slot of [1, 2, 3, 4] as const) {
+    const player = slotRecord(row, slot);
+    if (player && hash === player.tokenHash) {
+      return { id: player.id, name: player.name, slot } satisfies AuthorizedPlayer;
+    }
   }
   throw new RoomError("房间身份已失效，请重新加入。", 401);
 }
 
 async function touchPresence(row: RoomRow, player: AuthorizedPlayer) {
   const now = Date.now();
-  const previous = player.slot === 1 ? row.host_seen_at : row.guest_seen_at ?? 0;
+  const previous = slotRecord(row, player.slot)?.seenAt ?? 0;
   if (now - previous < SEEN_WRITE_INTERVAL_MS) return row;
-  const column = player.slot === 1 ? "host_seen_at" : "guest_seen_at";
+  const column = PRESENCE_COLUMNS[player.slot];
   await database().prepare(`UPDATE rooms SET ${column} = ?1, expires_at = ?2 WHERE code = ?3`).bind(now, now + ROOM_TTL_MS, row.code).run();
   if (player.slot === 1) row.host_seen_at = now;
-  else row.guest_seen_at = now;
+  else if (player.slot === 2) row.guest_seen_at = now;
+  else if (player.slot === 3) row.player3_seen_at = now;
+  else row.player4_seen_at = now;
   row.expires_at = now + ROOM_TTL_MS;
   return row;
 }
@@ -444,16 +534,18 @@ export async function joinRoom(codeInput: string, input: { name: unknown }) {
   const tokenHash = await hashToken(token);
   const playerId = crypto.randomUUID();
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
     const row = await readRoom(code);
-    if (row.guest_id) throw new RoomError("这个房间已经有两个人了。", 409);
+    const slot = nextOpenSlot(row);
+    if (!slot) throw new RoomError("这个房间已经有四个人了。", 409);
+    const columns = JOIN_SLOT_COLUMNS[slot];
     const now = Date.now();
     const activity = [newActivity({ id: playerId, name }, "join"), ...parseActivity(row)].slice(0, MAX_ACTIVITY);
     const result = await db.prepare(`
       UPDATE rooms SET
-        guest_id = ?1, guest_name = ?2, guest_token_hash = ?3, guest_seen_at = ?4,
+        ${columns.id} = ?1, ${columns.name} = ?2, ${columns.token} = ?3, ${columns.seen} = ?4,
         activity_json = ?5, version = version + 1, updated_at = ?4, expires_at = ?6
-      WHERE code = ?7 AND version = ?8 AND guest_id IS NULL
+      WHERE code = ?7 AND version = ?8 AND ${columns.id} IS NULL
     `).bind(playerId, name, tokenHash, now, JSON.stringify(activity), now + ROOM_TTL_MS, code, row.version).run();
     if ((result.meta.changes ?? 0) === 1) {
       const latest = await readRoom(code);

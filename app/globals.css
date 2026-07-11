@@ -861,12 +861,18 @@ a:focus-visible {
   font-weight: 700;
 }
 
+.player-1 .player-avatar { background: var(--cyan); }
 .player-2 .player-avatar { background: var(--danger); }
+.player-3 .player-avatar { background: var(--signal); }
+.player-4 .player-avatar { background: var(--green); }
 .player-card > div:nth-child(2) { min-width: 0; flex: 1; }
 .player-card strong { display: block; overflow: hidden; color: #edf0f2; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .player-card span { display: block; margin-top: 3px; color: #778692; font-size: 10px; }
 .player-card > i { width: 6px; height: 6px; border-radius: 50%; background: #59636b; }
-.player-card > i.online { background: var(--green); box-shadow: 0 0 8px rgba(189,231,91,.6); }
+.player-1 > i.online { background: var(--cyan); box-shadow: 0 0 8px rgba(91,224,214,.6); }
+.player-2 > i.online { background: var(--danger); box-shadow: 0 0 8px rgba(255,96,73,.6); }
+.player-3 > i.online { background: var(--signal); box-shadow: 0 0 8px rgba(255,210,63,.6); }
+.player-4 > i.online { background: var(--green); box-shadow: 0 0 8px rgba(189,231,91,.6); }
 
 .empty-player {
   margin-top: 8px;
@@ -898,10 +904,13 @@ a:focus-visible {
   height: 7px;
   margin-top: 5px;
   border-radius: 50%;
-  background: var(--cyan);
+  background: #59636b;
 }
 
+.activity-item > i.p1 { background: var(--cyan); }
 .activity-item > i.p2 { background: var(--danger); }
+.activity-item > i.p3 { background: var(--signal); }
+.activity-item > i.p4 { background: var(--green); }
 .activity-item p { margin: 0; color: #85939e; font-size: 10px; line-height: 1.55; }
 .activity-item strong { margin-right: 5px; color: #d3dade; font-size: 11px; }
 .activity-item time { display: block; margin-top: 2px; color: #53626d; font-family: var(--font-data); font-size: 8px; }

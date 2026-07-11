@@ -15,14 +15,14 @@ const mono = Space_Mono({
   weight: ["400", "700"],
 });
 
-const title = "同雷共苦｜双人在线扫雷";
-const description = "两个人，一块雷区，一段岌岌可危的友谊。支持经典多开、插旗保护与实时合作。";
+const title = "同雷共苦｜四人在线扫雷";
+const description = "最多四个人，一块雷区，一段岌岌可危的友谊。支持经典多开、插旗保护与实时合作。";
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
   const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host") ?? "localhost:3000";
   const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.includes("localhost") ? "http" : "https");
-  const imageUrl = `${protocol}://${host}/og.png`;
+  const imageUrl = `${protocol}://${host}/og-v2.png`;
 
   return {
     title,
@@ -32,7 +32,7 @@ export async function generateMetadata(): Promise<Metadata> {
       locale: "zh_CN",
       title,
       description,
-      images: [{ url: imageUrl, width: 1536, height: 1024, alt: "同雷共苦双人在线扫雷" }],
+      images: [{ url: imageUrl, width: 1536, height: 1024, alt: "同雷共苦四人在线扫雷" }],
     },
     twitter: {
       card: "summary_large_image",
