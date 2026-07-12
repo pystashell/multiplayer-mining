@@ -4,8 +4,10 @@ import {
   getRoom,
   joinAsSpectator,
   joinRoom,
+  leaveMembership,
   postRoomMessage,
   RoomError,
+  switchRole,
   type WireAction,
 } from "../../../../lib/rooms";
 
@@ -51,6 +53,7 @@ export async function POST(request: Request, context: RouteContext) {
       name?: unknown;
       content?: unknown;
       message?: unknown;
+      targetRole?: unknown;
       action?: WireAction;
     };
     if (payload.op === "join") {
@@ -62,6 +65,14 @@ export async function POST(request: Request, context: RouteContext) {
       await enforceRateLimit(request, "join-room", 30, 10 * 60 * 1000);
       const result = await joinAsSpectator(code, { name: payload.name });
       return Response.json(result, { status: 201, headers: noStore });
+    }
+    if (payload.op === "switchRole") {
+      const result = await switchRole(code, tokenFrom(request), payload.targetRole);
+      return Response.json(result, { headers: noStore });
+    }
+    if (payload.op === "leaveMembership") {
+      const result = await leaveMembership(code, tokenFrom(request));
+      return Response.json({ left: true, code: result.code }, { headers: noStore });
     }
     if (payload.op === "chat") {
       const result = await postRoomMessage(code, tokenFrom(request), payload.message ?? payload.content);

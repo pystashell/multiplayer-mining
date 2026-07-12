@@ -232,7 +232,7 @@ test("renders the shared revival prompt, player-only ad, spectator countdown, an
   assert.match(app, /\{ type: "watchAd" \}/);
   assert.match(app, /\{ type: "endGame" \}/);
   assert.match(app, /const isRevivalLocked = Boolean\(revival\)/);
-  assert.match(app, /disabled=\{isSpectator \|\| isRevivalLocked \|\| room\.game\.status === "won" \|\| room\.game\.status === "lost"\}/);
+  assert.match(app, /disabled=\{isSpectator \|\| isRevivalLocked \|\| isMembershipPending \|\| room\.game\.status === "won" \|\| room\.game\.status === "lost"\}/);
   assert.match(app, /className=\{`revival-overlay revival-\$\{revival\.phase\}`\}/);
   assert.match(app, /submitRevivalDecision\("watchAd"\)/);
   assert.match(app, /submitRevivalDecision\("endGame"\)/);
@@ -269,4 +269,109 @@ test("renders the shared revival prompt, player-only ad, spectator countdown, an
   assert.match(css, /\.revival-countdown/);
   assert.match(css, /\.revival-watch-button/);
   assert.match(css, /\.revival-end-button/);
+});
+
+test("keeps player and spectator memberships mutually exclusive while switching roles", async () => {
+  const [rooms, route] = await Promise.all([
+    readFile(new URL("../lib/rooms.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/rooms/[code]/route.ts", import.meta.url), "utf8"),
+  ]);
+  const exportedSource = (name) => {
+    const start = rooms.indexOf(`export async function ${name}`);
+    assert.ok(start >= 0, `missing ${name}`);
+    const next = rooms.indexOf("\nexport async function ", start + 1);
+    return rooms.slice(start, next === -1 ? undefined : next);
+  };
+  const switchSource = exportedSource("switchRole");
+
+  assert.match(route, /switchRole/);
+  assert.match(route, /payload\.op === "switchRole"/);
+  assert.match(route, /targetRole\?: unknown/);
+  assert.match(route, /switchRole\(code, tokenFrom\(request\), payload\.targetRole\)/);
+  assert.match(switchSource, /targetRole/);
+  assert.match(switchSource, /targetRole !== "player" && targetRole !== "spectator"/);
+
+  // Repeating the active role is a no-op and must keep the existing token/id.
+  assert.match(switchSource, /identity\.role === targetRole/);
+  assert.match(switchSource, /session:[\s\S]{0,260}\btoken\b[\s\S]{0,260}playerId: identity\.id/);
+  assert.match(switchSource, /playerName: identity\.name[\s\S]{0,100}role: targetRole/);
+
+  // Moving from a player seat to the spectator table must reuse the same
+  // identity while clearing the occupied slot in the same guarded operation.
+  assert.match(switchSource, /INSERT INTO room_spectators/);
+  assert.match(switchSource, /identity\.id/);
+  assert.match(switchSource, /identity\.name/);
+  assert.match(switchSource, /db\.batch\(/);
+
+  // A spectator-to-player switch checks capacity before deleting the spectator
+  // row, so a full-room 409 leaves that spectator membership intact.
+  const capacityCheck = switchSource.indexOf("nextOpenSlot(row)");
+  const fullRoomFailure = switchSource.indexOf("409", capacityCheck);
+  const spectatorRemoval = switchSource.indexOf("DELETE FROM room_spectators", capacityCheck);
+  assert.ok(
+    capacityCheck >= 0 && fullRoomFailure > capacityCheck && spectatorRemoval > fullRoomFailure,
+    "room capacity must be rejected before removing the spectator membership",
+  );
+  assert.match(switchSource, /DELETE FROM room_spectators[\s\S]{0,180}room_code/);
+});
+
+test("reclaims the host sentinel first and releases either membership on explicit leave", async () => {
+  const [rooms, route] = await Promise.all([
+    readFile(new URL("../lib/rooms.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/rooms/[code]/route.ts", import.meta.url), "utf8"),
+  ]);
+  const functionSlice = (startMarker, endMarker) => {
+    const start = rooms.indexOf(startMarker);
+    assert.ok(start >= 0, `missing ${startMarker}`);
+    const end = rooms.indexOf(endMarker, start + startMarker.length);
+    return rooms.slice(start, end === -1 ? undefined : end);
+  };
+  const slotSource = functionSlice("function slotRecord", "export async function enforceRateLimit");
+  const leaveSource = functionSlice("export async function leaveMembership", "\nexport async function ");
+
+  // slot 1 uses empty strings because the legacy rooms table keeps host fields
+  // NOT NULL. Empty hosts are omitted from PublicRoom.players and claimed first.
+  assert.match(slotSource, /slot === 1[\s\S]{0,300}!row\.host_id/);
+  assert.match(slotSource, /function nextOpenSlot[\s\S]{0,220}!row\.host_id[\s\S]{0,100}return 1/);
+  assert.match(rooms, /host_id = ''/);
+  assert.match(rooms, /host_name = ''/);
+  assert.match(rooms, /host_token_hash = ''/);
+  assert.match(rooms, /host_seen_at = 0/);
+  assert.match(rooms, /WHERE[\s\S]{0,180}host_id = ''/);
+
+  assert.match(route, /payload\.op === "leaveMembership"/);
+  assert.match(route, /leaveMembership\(code, tokenFrom\(request\)\)/);
+  assert.match(route, /left: true/);
+  assert.match(route, /\bcode\b/);
+  assert.match(leaveSource, /authenticate\(row, token\)/);
+  assert.match(leaveSource, /identity\.role === "spectator"/);
+  assert.match(leaveSource, /DELETE FROM room_spectators/);
+  assert.match(leaveSource, /left: true/);
+  assert.match(leaveSource, /code: row\.code/);
+});
+
+test("offers temporary leave, explicit release, and token-preserving role switches in the UI", async () => {
+  const app = await readFile(new URL("../app/MinefieldApp.tsx", import.meta.url), "utf8");
+
+  assert.match(app, /暂时离开/);
+  assert.match(app, /释放[^"<]{0,12}席位|退出[^"<]{0,12}席位/);
+  assert.match(app, /转为旁观者/);
+  assert.match(app, /加入雷区/);
+  assert.match(app, /JSON\.stringify\(\{ op: "switchRole", targetRole \}\)/);
+  assert.match(app, /JSON\.stringify\(\{ op: "leaveMembership" \}\)/);
+  assert.match(app, /"x-player-token": activeSession\.token/);
+
+  // Entering the same paused room takes the authenticated switch path instead
+  // of minting a second identity, then persists the returned session/token.
+  assert.match(app, /pausedSession\?\.code === cleanCode/);
+  assert.match(app, /persistSession\(payload\.session\)/);
+  assert.match(app, /setPausedSession\(session\)/);
+  assert.match(app, /const resumeRoom[\s\S]{0,260}persistSession\(pausedSession\)/);
+
+  // Explicit membership release is different from temporary leave: no resume
+  // token survives and both room code and name must be entered again.
+  assert.match(app, /localStorage\.removeItem\(SESSION_KEY\)/);
+  assert.match(app, /setPausedSession\(null\)/);
+  assert.match(app, /setJoinCode\(""\)/);
+  assert.match(app, /setName\(""\)/);
 });

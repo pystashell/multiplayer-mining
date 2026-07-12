@@ -187,6 +187,7 @@ export function MinefieldApp() {
   const [tapMode, setTapMode] = useState<"reveal" | "mark">("reveal");
   const [chatDraft, setChatDraft] = useState("");
   const [sendingChat, setSendingChat] = useState(false);
+  const [membershipAction, setMembershipAction] = useState<"player" | "spectator" | "leave" | null>(null);
   const [revivalDecision, setRevivalDecision] = useState<"watchAd" | "endGame" | null>(null);
   const [chordPreviewIndex, setChordPreviewIndex] = useState<number | null>(null);
   const [now, setNow] = useState(0);
@@ -353,8 +354,74 @@ export function MinefieldApp() {
     setPausedSession(null);
     setChatDraft("");
     setSendingChat(false);
+    setMembershipAction(null);
     setRevivalDecision(null);
     setSession(next);
+  };
+
+  const switchRole = async (targetRole: "player" | "spectator", sourceSession: Session | null = sessionRef.current) => {
+    if (!sourceSession || membershipAction) return false;
+    const wasActive = sessionRef.current?.token === sourceSession.token;
+    setMembershipAction(targetRole);
+    setError("");
+    try {
+      const response = await fetch(`/api/rooms/${sourceSession.code}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-player-token": sourceSession.token,
+        },
+        body: JSON.stringify({ op: "switchRole", targetRole }),
+      });
+      const payload = (await readJson(response)) as { room: Room; session: Session };
+      if (wasActive && sessionRef.current?.token !== sourceSession.token) return false;
+      persistSession(payload.session);
+      acceptRoom(payload.room);
+      setConnected(true);
+      return true;
+    } catch (switchError) {
+      setError(displayError(switchError));
+      return false;
+    } finally {
+      setMembershipAction(null);
+    }
+  };
+
+  const leaveMembership = async () => {
+    const activeSession = sessionRef.current;
+    if (!activeSession || membershipAction) return;
+    setMembershipAction("leave");
+    setError("");
+    try {
+      const response = await fetch(`/api/rooms/${activeSession.code}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-player-token": activeSession.token,
+        },
+        body: JSON.stringify({ op: "leaveMembership" }),
+      });
+      await readJson(response) as { left: true; code: string };
+      if (sessionRef.current?.token !== activeSession.token) return;
+      window.localStorage.removeItem(SESSION_KEY);
+      sessionRef.current = null;
+      roomRef.current = null;
+      actionQueue.current = Promise.resolve();
+      setSession(null);
+      setRoom(null);
+      setPausedSession(null);
+      setName("");
+      setJoinCode("");
+      setChatDraft("");
+      setSendingChat(false);
+      setRevivalDecision(null);
+      setNotice("");
+      setError("");
+    } catch (leaveError) {
+      if (sessionRef.current?.token === activeSession.token) setError(displayError(leaveError));
+    } finally {
+      setMembershipAction(null);
+    }
   };
 
   const createRoom = async (event: FormEvent) => {
@@ -382,11 +449,22 @@ export function MinefieldApp() {
   const enterRoom = async (op: "join" | "spectate") => {
     const cleanName = name.trim();
     const cleanCode = joinCode.replace(/[^a-z0-9]/gi, "").toUpperCase();
+    const targetRole = op === "join" ? "player" : "spectator";
     if (!cleanName) return setError("先留个名字，不然队友没法甩锅。 ");
     if (cleanCode.length !== 6) return setError("房间码是 6 位，检查一下再进。 ");
     setLoading(true);
     setError("");
     try {
+      if (pausedSession?.code === cleanCode) {
+        const pausedRole = pausedSession.role ?? "player";
+        if (pausedRole === targetRole) {
+          persistSession(pausedSession);
+          await fetchRoom(pausedSession);
+        } else {
+          await switchRole(targetRole, pausedSession);
+        }
+        return;
+      }
       const response = await fetch(`/api/rooms/${cleanCode}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -409,6 +487,7 @@ export function MinefieldApp() {
   };
 
   const leaveRoom = () => {
+    if (membershipAction) return;
     if (session) setPausedSession(session);
     sessionRef.current = null;
     actionQueue.current = Promise.resolve();
@@ -422,9 +501,8 @@ export function MinefieldApp() {
   };
 
   const resumeRoom = () => {
-    if (!pausedSession) return;
-    sessionRef.current = pausedSession;
-    setSession(pausedSession);
+    if (!pausedSession || loading) return;
+    persistSession(pausedSession);
     void fetchRoom(pausedSession);
   };
 
@@ -580,6 +658,7 @@ export function MinefieldApp() {
   const status = room ? statusCopy(room.game, room.players) : null;
   const revival = room?.revival ?? null;
   const isRevivalLocked = Boolean(revival);
+  const isMembershipPending = Boolean(membershipAction);
   const seconds = room ? secondsFor(room.game, revival?.createdAt ?? now) : 0;
   const adSecondsRemaining = revival?.phase === "ad" && revival.adEndsAt
     ? Math.max(0, Math.min(10, Math.ceil((revival.adEndsAt - now) / 1000)))
@@ -631,7 +710,7 @@ export function MinefieldApp() {
               <span className="console-index">01</span>
             </div>
             {pausedSession && (
-              <button className="resume-room" type="button" onClick={resumeRoom}>
+              <button className="resume-room" type="button" disabled={loading || Boolean(membershipAction)} onClick={resumeRoom}>
                 <span>{pausedSession.role === "spectator" ? "继续旁观" : "继续刚才的房间"}</span><strong>{pausedSession.code}</strong><b aria-hidden="true">→</b>
               </button>
             )}
@@ -656,8 +735,8 @@ export function MinefieldApp() {
               <label className="sr-only" htmlFor="room-code">6 位房间码</label>
               <input id="room-code" className="text-input code-input" value={joinCode} maxLength={6} onChange={(event) => setJoinCode(event.target.value.replace(/[^a-z0-9]/gi, "").toUpperCase())} placeholder="房间码" autoCapitalize="characters" />
               <div className="join-actions">
-                <button className="secondary-button" disabled={loading} type="submit">加入游戏</button>
-                <button className="spectate-button" disabled={loading} type="button" onClick={() => void enterRoom("spectate")}>作为旁观者加入</button>
+                <button className="secondary-button" disabled={loading} type="submit">{loading ? "处理中…" : "加入游戏"}</button>
+                <button className="spectate-button" disabled={loading} type="button" onClick={() => void enterRoom("spectate")}>{loading ? "处理中…" : "作为旁观者加入"}</button>
               </div>
             </form>
             <p className="spectate-hint">旁观不占玩家席位 · 可以看棋盘和参与聊天</p>
@@ -673,7 +752,7 @@ export function MinefieldApp() {
   return (
     <main className="site-shell game-shell">
       <header className="topbar game-topbar">
-        <button className="brand brand-button" onClick={leaveRoom} aria-label="暂时离开房间返回首页">
+        <button className="brand brand-button" disabled={isMembershipPending} onClick={leaveRoom} aria-label="暂时离开并保留席位，返回首页">
           <span className="brand-mark" aria-hidden="true">✹</span><span>同雷共苦</span>
         </button>
         <div className="room-identity">
@@ -701,7 +780,7 @@ export function MinefieldApp() {
           <section className={`mine-console status-${room.game.status}${isRevivalLocked ? " revival-active" : ""}`} aria-label="扫雷棋盘">
             <div className="classic-display">
               <div className="digit-box"><small>剩余雷数</small><strong>{formatCounter(room.game.mines - room.game.flags)}</strong></div>
-              <button className="face-button" onClick={() => commitAction({ type: "restart" })} aria-label={isSpectator ? "旁观模式，不能重新开始" : isRevivalLocked ? "事故处理中，暂时不能重新开始" : "重新开始"} disabled={isSpectator || isRevivalLocked}>
+              <button className="face-button" onClick={() => commitAction({ type: "restart" })} aria-label={isSpectator ? "旁观模式，不能重新开始" : isRevivalLocked ? "事故处理中，暂时不能重新开始" : "重新开始"} disabled={isSpectator || isRevivalLocked || isMembershipPending}>
                 {isRevivalLocked ? "⊙_⊙" : room.game.status === "lost" ? "×_×" : room.game.status === "won" ? "^‿^" : room.game.status === "playing" ? "•_•" : "•‿•"}
               </button>
               <div className="digit-box align-right"><small>用时</small><strong>{formatCounter(seconds)}</strong></div>
@@ -727,7 +806,7 @@ export function MinefieldApp() {
                       className={`mine-cell ${stateClass}`}
                       role="gridcell"
                       aria-label={label}
-                      disabled={isSpectator || isRevivalLocked || room.game.status === "won" || room.game.status === "lost"}
+                      disabled={isSpectator || isRevivalLocked || isMembershipPending || room.game.status === "won" || room.game.status === "lost"}
                       onClick={() => handleCellClick(cell)}
                       onDoubleClick={(event) => { event.preventDefault(); if (cell.state === "revealed") commitAction({ type: "chord", index: cell.index }); }}
                       onMouseDown={(event) => beginClassicChord(event, cell)}
@@ -751,8 +830,8 @@ export function MinefieldApp() {
 
             {!isSpectator && (
               <div className={`mobile-mode${isRevivalLocked ? " locked" : ""}`} role="group" aria-label="触屏操作模式">
-                <button className={tapMode === "reveal" ? "active" : ""} disabled={isRevivalLocked} onClick={() => setTapMode("reveal")}>轻触排雷</button>
-                <button className={tapMode === "mark" ? "active" : ""} disabled={isRevivalLocked} onClick={() => setTapMode("mark")}>轻触标记</button>
+                <button className={tapMode === "reveal" ? "active" : ""} disabled={isRevivalLocked || isMembershipPending} onClick={() => setTapMode("reveal")}>轻触排雷</button>
+                <button className={tapMode === "mark" ? "active" : ""} disabled={isRevivalLocked || isMembershipPending} onClick={() => setTapMode("mark")}>轻触标记</button>
                 <span>也可长按插旗</span>
               </div>
             )}
@@ -834,14 +913,22 @@ export function MinefieldApp() {
                   <>
                     <div className="settings-field">
                       <label htmlFor="game-difficulty">难度</label>
-                      <select id="game-difficulty" value={currentDifficulty} disabled={isRevivalLocked} onChange={(event) => commitAction({ type: "changeDifficulty", difficulty: event.target.value as Difficulty })}>
+                      <select id="game-difficulty" value={currentDifficulty} disabled={isRevivalLocked || isMembershipPending} onChange={(event) => commitAction({ type: "changeDifficulty", difficulty: event.target.value as Difficulty })}>
                         {(Object.keys(DIFFICULTIES) as Difficulty[]).map((key) => <option value={key} key={key}>{DIFFICULTIES[key].label} · {DIFFICULTIES[key].meta}</option>)}
                       </select>
                     </div>
-                    <button className="restart-button" disabled={isRevivalLocked} onClick={() => commitAction({ type: "restart" })}>重新布置雷区</button>
+                    <button className="restart-button" type="button" disabled={isRevivalLocked || isMembershipPending} onClick={() => commitAction({ type: "restart" })}>重新布置雷区</button>
                   </>
                 )}
-                <button className="leave-button" onClick={leaveRoom}>{isSpectator ? "离开旁观席" : "暂时离开房间"}</button>
+                <div className="membership-actions">
+                  <button className="membership-switch-button" type="button" disabled={isMembershipPending} onClick={() => void switchRole(isSpectator ? "player" : "spectator")}>
+                    {membershipAction === "player" ? "正在加入雷区…" : membershipAction === "spectator" ? "正在转入旁观席…" : isSpectator ? "加入雷区" : "转为旁观者"}
+                  </button>
+                  <button className="leave-button" type="button" disabled={isMembershipPending} onClick={leaveRoom}>暂时离开（保留席位）</button>
+                  <button className="membership-exit-button" type="button" disabled={isMembershipPending} onClick={() => void leaveMembership()}>
+                    {membershipAction === "leave" ? "正在退出…" : isSpectator ? "退出旁观席" : "退出雷区并释放席位"}
+                  </button>
+                </div>
               </div>
             </section>
 

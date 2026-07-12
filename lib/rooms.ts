@@ -287,6 +287,7 @@ type RoomIncident = {
 type AuthorizedPlayer = {
   id: string;
   name: string;
+  tokenHash: string;
   slot: 1 | 2 | 3 | 4;
   role: "player";
   seenAt: number;
@@ -295,6 +296,7 @@ type AuthorizedPlayer = {
 type AuthorizedSpectator = {
   id: string;
   name: string;
+  tokenHash: string;
   slot: null;
   role: "spectator";
   seenAt: number;
@@ -303,7 +305,7 @@ type AuthorizedSpectator = {
 type AuthorizedIdentity = AuthorizedPlayer | AuthorizedSpectator;
 
 type PlayerSlot = AuthorizedPlayer["slot"];
-type JoinableSlot = Exclude<PlayerSlot, 1>;
+type JoinableSlot = PlayerSlot;
 
 type SlotRecord = {
   id: string;
@@ -313,9 +315,38 @@ type SlotRecord = {
 };
 
 const JOIN_SLOT_COLUMNS = {
-  2: { id: "guest_id", name: "guest_name", token: "guest_token_hash", seen: "guest_seen_at" },
-  3: { id: "player3_id", name: "player3_name", token: "player3_token_hash", seen: "player3_seen_at" },
-  4: { id: "player4_id", name: "player4_name", token: "player4_token_hash", seen: "player4_seen_at" },
+  1: {
+    id: "host_id",
+    name: "host_name",
+    token: "host_token_hash",
+    seen: "host_seen_at",
+    free: "host_id = ''",
+    release: "host_id = '', host_name = '', host_token_hash = '', host_seen_at = 0",
+  },
+  2: {
+    id: "guest_id",
+    name: "guest_name",
+    token: "guest_token_hash",
+    seen: "guest_seen_at",
+    free: "guest_id IS NULL",
+    release: "guest_id = NULL, guest_name = NULL, guest_token_hash = NULL, guest_seen_at = NULL",
+  },
+  3: {
+    id: "player3_id",
+    name: "player3_name",
+    token: "player3_token_hash",
+    seen: "player3_seen_at",
+    free: "player3_id IS NULL",
+    release: "player3_id = NULL, player3_name = NULL, player3_token_hash = NULL, player3_seen_at = NULL",
+  },
+  4: {
+    id: "player4_id",
+    name: "player4_name",
+    token: "player4_token_hash",
+    seen: "player4_seen_at",
+    free: "player4_id IS NULL",
+    release: "player4_id = NULL, player4_name = NULL, player4_token_hash = NULL, player4_seen_at = NULL",
+  },
 } as const;
 
 const PRESENCE_COLUMNS: Record<PlayerSlot, string> = {
@@ -381,6 +412,7 @@ export async function ensureRoomSchema() {
 
 function slotRecord(row: RoomRow, slot: PlayerSlot): SlotRecord | null {
   if (slot === 1) {
+    if (!row.host_id || !row.host_name || !row.host_token_hash) return null;
     return {
       id: row.host_id,
       name: row.host_name,
@@ -400,6 +432,7 @@ function slotRecord(row: RoomRow, slot: PlayerSlot): SlotRecord | null {
 }
 
 function nextOpenSlot(row: RoomRow): JoinableSlot | null {
+  if (!row.host_id) return 1;
   if (!row.guest_id) return 2;
   if (!row.player3_id) return 3;
   if (!row.player4_id) return 4;
@@ -680,6 +713,7 @@ async function authenticate(row: RoomRow, token: string | null) {
       return {
         id: player.id,
         name: player.name,
+        tokenHash: player.tokenHash,
         slot,
         role: "player",
         seenAt: player.seenAt,
@@ -696,6 +730,7 @@ async function authenticate(row: RoomRow, token: string | null) {
     return {
       id: spectator.id,
       name: spectator.name,
+      tokenHash: hash,
       slot: null,
       role: "spectator",
       seenAt: spectator.seen_at,
@@ -898,12 +933,22 @@ export async function joinRoom(codeInput: string, input: { name: unknown }) {
     const columns = JOIN_SLOT_COLUMNS[slot];
     const now = Date.now();
     const activity = [newActivity({ id: playerId, name }, "join"), ...parseActivity(row)].slice(0, MAX_ACTIVITY);
-    const result = await db.prepare(`
-      UPDATE rooms SET
-        ${columns.id} = ?1, ${columns.name} = ?2, ${columns.token} = ?3, ${columns.seen} = ?4,
-        activity_json = ?5, version = version + 1, updated_at = ?4, expires_at = ?6
-      WHERE code = ?7 AND version = ?8 AND ${columns.id} IS NULL
-    `).bind(playerId, name, tokenHash, now, JSON.stringify(activity), now + ROOM_TTL_MS, code, row.version).run();
+    const statement = slot === 1
+      ? db.prepare(`
+          UPDATE rooms SET
+            host_id = ?1, host_name = ?2, host_token_hash = ?3, host_seen_at = ?4,
+            activity_json = ?5, version = version + 1, updated_at = ?4, expires_at = ?6
+          WHERE code = ?7 AND version = ?8 AND host_id = ''
+        `)
+      : db.prepare(`
+          UPDATE rooms SET
+            ${columns.id} = ?1, ${columns.name} = ?2, ${columns.token} = ?3, ${columns.seen} = ?4,
+            activity_json = ?5, version = version + 1, updated_at = ?4, expires_at = ?6
+          WHERE code = ?7 AND version = ?8 AND ${columns.id} IS NULL
+        `);
+    const result = await statement
+      .bind(playerId, name, tokenHash, now, JSON.stringify(activity), now + ROOM_TTL_MS, code, row.version)
+      .run();
     if ((result.meta.changes ?? 0) === 1) {
       const latest = await readRoom(code);
       return {
@@ -957,6 +1002,198 @@ export async function joinAsSpectator(codeInput: string, input: { name: unknown 
       role: "spectator",
     } satisfies SpectatorSession,
   };
+}
+
+export async function switchRole(
+  codeInput: string,
+  token: string | null,
+  targetRole: unknown,
+) {
+  if (targetRole !== "player" && targetRole !== "spectator") {
+    throw new RoomError("无法识别要切换的房间身份。", 400);
+  }
+  const db = database();
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    let row = await readRoom(codeInput);
+    const identity = await authenticate(row, token);
+    row = await settleExpiredIncident(row);
+
+    if (identity.role === targetRole) {
+      await touchPresence(row, identity);
+      return {
+        room: await toPublicRoom(row),
+        session: {
+          code: row.code,
+          token: token!,
+          playerId: identity.id,
+          playerName: identity.name,
+          role: targetRole,
+        } as PlayerSession | SpectatorSession,
+      };
+    }
+
+    if (parseIncident(row)) {
+      throw new RoomError("踩雷事故处理期间不能切换身份。", 409);
+    }
+
+    const now = Date.now();
+
+    if (identity.role === "player") {
+      const columns = JOIN_SLOT_COLUMNS[identity.slot];
+      await db.prepare("DELETE FROM room_spectators WHERE room_code = ?1 AND seen_at < ?2")
+        .bind(row.code, now - SPECTATOR_STALE_MS)
+        .run();
+
+      const [inserted, released, repaired] = await db.batch([
+        db.prepare(`
+          INSERT INTO room_spectators (
+            id, room_code, name, token_hash, seen_at, created_at
+          )
+          SELECT ?1, ?2, ?3, ?4, ?5, ?5
+          WHERE (SELECT COUNT(*) FROM room_spectators WHERE room_code = ?2) < ${MAX_SPECTATORS}
+            AND EXISTS (
+              SELECT 1 FROM rooms
+              WHERE code = ?2 AND version = ?6 AND incident_json IS NULL
+                AND ${columns.id} = ?1 AND ${columns.token} = ?4
+            )
+          ON CONFLICT DO NOTHING
+        `).bind(identity.id, row.code, identity.name, identity.tokenHash, now, row.version),
+        db.prepare(`
+          UPDATE rooms SET
+            ${columns.release}, version = version + 1,
+            updated_at = ?5, expires_at = ?6
+          WHERE code = ?1 AND version = ?2 AND incident_json IS NULL
+            AND ${columns.id} = ?3 AND ${columns.token} = ?4
+            AND EXISTS (
+              SELECT 1 FROM room_spectators
+              WHERE room_code = ?1 AND id = ?3 AND token_hash = ?4
+            )
+        `).bind(row.code, row.version, identity.id, identity.tokenHash, now, now + ROOM_TTL_MS),
+        db.prepare(`
+          DELETE FROM room_spectators
+          WHERE room_code = ?1 AND id = ?2 AND token_hash = ?3
+            AND EXISTS (
+              SELECT 1 FROM rooms
+              WHERE code = ?1 AND ${columns.id} = ?2 AND ${columns.token} = ?3
+            )
+        `).bind(row.code, identity.id, identity.tokenHash),
+      ]);
+      void repaired;
+
+      if ((released.meta.changes ?? 0) === 1) {
+        const latest = await readRoom(row.code);
+        return {
+          room: await toPublicRoom(latest, now),
+          session: {
+            code: row.code,
+            token: token!,
+            playerId: identity.id,
+            playerName: identity.name,
+            role: targetRole as "spectator",
+          } satisfies SpectatorSession,
+        };
+      }
+
+      if ((inserted.meta.changes ?? 0) === 0) {
+        const capacity = await db.prepare(`
+          SELECT COUNT(*) AS count FROM room_spectators WHERE room_code = ?1
+        `).bind(row.code).first<{ count: number }>();
+        if ((capacity?.count ?? 0) >= MAX_SPECTATORS) {
+          throw new RoomError("这个房间已经有 20 位旁观者了。", 409);
+        }
+      }
+      continue;
+    }
+
+    const slot = nextOpenSlot(row);
+    if (!slot) throw new RoomError("这个房间已经有四位玩家了。", 409);
+    const columns = JOIN_SLOT_COLUMNS[slot];
+    const [occupied, removed] = await db.batch([
+      db.prepare(`
+        UPDATE rooms SET
+          ${columns.id} = ?3, ${columns.name} = ?4,
+          ${columns.token} = ?5, ${columns.seen} = ?6,
+          version = version + 1, updated_at = ?6, expires_at = ?7
+        WHERE code = ?1 AND version = ?2 AND incident_json IS NULL
+          AND ${columns.free}
+          AND EXISTS (
+            SELECT 1 FROM room_spectators
+            WHERE room_code = ?1 AND id = ?3 AND token_hash = ?5
+          )
+      `).bind(
+        row.code,
+        row.version,
+        identity.id,
+        identity.name,
+        identity.tokenHash,
+        now,
+        now + ROOM_TTL_MS,
+      ),
+      db.prepare(`
+        DELETE FROM room_spectators
+        WHERE room_code = ?1 AND id = ?2 AND token_hash = ?3
+          AND EXISTS (
+            SELECT 1 FROM rooms
+            WHERE code = ?1 AND ${columns.id} = ?2 AND ${columns.token} = ?3
+          )
+      `).bind(row.code, identity.id, identity.tokenHash),
+    ]);
+
+    if ((occupied.meta.changes ?? 0) === 1 && (removed.meta.changes ?? 0) === 1) {
+      const latest = await readRoom(row.code);
+      return {
+        room: await toPublicRoom(latest, now),
+        session: {
+          code: row.code,
+          token: token!,
+          playerId: identity.id,
+          playerName: identity.name,
+          role: targetRole as "player",
+        } satisfies PlayerSession,
+      };
+    }
+  }
+
+  throw new RoomError("房间成员刚好发生了变化，请再试一次。", 409);
+}
+
+export async function leaveMembership(codeInput: string, token: string | null) {
+  const db = database();
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const row = await readRoom(codeInput);
+    const identity = await authenticate(row, token);
+    const now = Date.now();
+
+    if (identity.role === "spectator") {
+      const [removed] = await db.batch([
+        db.prepare(`
+          DELETE FROM room_spectators
+          WHERE room_code = ?1 AND id = ?2 AND token_hash = ?3
+        `).bind(row.code, identity.id, identity.tokenHash),
+        db.prepare(`
+          UPDATE rooms
+          SET version = version + 1, updated_at = ?2, expires_at = ?3
+          WHERE code = ?1
+        `).bind(row.code, now, now + ROOM_TTL_MS),
+      ]);
+      if ((removed.meta.changes ?? 0) === 1) return { left: true as const, code: row.code };
+      continue;
+    }
+
+    const columns = JOIN_SLOT_COLUMNS[identity.slot];
+    const released = await db.prepare(`
+      UPDATE rooms SET
+        ${columns.release}, version = version + 1,
+        updated_at = ?5, expires_at = ?6
+      WHERE code = ?1 AND version = ?2
+        AND ${columns.id} = ?3 AND ${columns.token} = ?4
+    `).bind(row.code, row.version, identity.id, identity.tokenHash, now, now + ROOM_TTL_MS).run();
+    if ((released.meta.changes ?? 0) === 1) return { left: true as const, code: row.code };
+  }
+
+  throw new RoomError("房间成员刚好发生了变化，请再试一次。", 409);
 }
 
 export async function getRoom(codeInput: string, token: string | null) {

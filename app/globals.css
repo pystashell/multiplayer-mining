@@ -133,6 +133,8 @@ a:focus-visible {
   cursor: pointer;
 }
 
+.brand-button:disabled { cursor: wait; opacity: .5; }
+
 .topbar-note,
 .connection-state {
   display: inline-flex;
@@ -342,6 +344,7 @@ a:focus-visible {
 .resume-room strong { font-family: var(--font-data); font-size: 13px; letter-spacing: .12em; }
 .resume-room b { color: #52636c; font-family: var(--font-data); }
 .resume-room:hover { border-color: var(--ink); background: #deddd5; }
+.resume-room:disabled { cursor: wait; opacity: .55; }
 
 .text-input,
 .settings-section select {
@@ -1208,20 +1211,30 @@ a:focus-visible {
 
 .settings-controls {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(150px, .48fr) minmax(125px, .4fr);
+  grid-template-columns: minmax(220px, 1fr) minmax(160px, .48fr);
   align-items: end;
   gap: 12px;
 }
 
 .settings-controls.spectator-controls {
-  grid-template-columns: minmax(0, 1fr) minmax(150px, auto);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .settings-field { min-width: 0; }
 .settings-field label { margin-bottom: 7px; }
 .settings-controls .restart-button,
-.settings-controls .leave-button { margin-top: 0; }
+.settings-controls .leave-button,
+.settings-controls .membership-switch-button,
+.settings-controls .membership-exit-button { margin-top: 0; }
 .settings-controls .spectator-note { align-self: center; margin: 0; }
+
+.membership-actions {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+  padding-top: 3px;
+}
 
 .board-activity-section .activity-list {
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1553,7 +1566,9 @@ a:focus-visible {
 .settings-section label { color: #73828e; }
 
 .restart-button,
-.leave-button {
+.leave-button,
+.membership-switch-button,
+.membership-exit-button {
   width: 100%;
   height: 40px;
   margin-top: 8px;
@@ -1567,10 +1582,17 @@ a:focus-visible {
 
 .restart-button:hover { border-color: var(--signal); color: var(--signal); }
 .restart-button:disabled,
+.membership-switch-button:disabled,
+.membership-exit-button:disabled,
+.leave-button:disabled,
 .settings-section select:disabled { cursor: not-allowed; opacity: .45; }
 .restart-button:disabled:hover { border-color: rgba(255,255,255,.14); color: #b4bec6; }
+.membership-switch-button { border-color: rgba(91,224,214,.32); color: var(--cyan); }
+.membership-switch-button:hover:not(:disabled) { border-color: var(--cyan); background: rgba(91,224,214,.06); }
 .leave-button { border: 0; color: #687782; }
-.leave-button:hover { color: var(--danger); }
+.leave-button:hover:not(:disabled) { color: #aab5bd; background: rgba(255,255,255,.025); }
+.membership-exit-button { border-color: rgba(255,96,73,.23); color: #a97770; }
+.membership-exit-button:hover:not(:disabled) { border-color: var(--danger); background: rgba(255,96,73,.055); color: #ff8371; }
 
 .toast {
   position: fixed;
@@ -1655,6 +1677,7 @@ a:focus-visible {
   .board-lower-panels .panel-section { padding: 18px 15px; }
   .settings-controls,
   .settings-controls.spectator-controls { grid-template-columns: 1fr; }
+  .membership-actions { grid-template-columns: 1fr; }
   .board-activity-section .activity-list { grid-template-columns: 1fr; }
   .board-activity-section .empty-activity { grid-column: auto; }
   .side-panel { grid-template-columns: 1fr; }
