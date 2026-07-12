@@ -6,6 +6,7 @@ export const rooms = sqliteTable("rooms", {
   version: integer("version").notNull().default(1),
   gameJson: text("game_json").notNull(),
   activityJson: text("activity_json").notNull().default("[]"),
+  incidentJson: text("incident_json"),
   hostId: text("host_id").notNull(),
   hostName: text("host_name").notNull(),
   hostTokenHash: text("host_token_hash").notNull(),

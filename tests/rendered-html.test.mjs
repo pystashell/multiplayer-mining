@@ -113,3 +113,134 @@ test("enforces spectator and chat constraints in the API and D1 schema", async (
     "expected an index for expired rate-limit cleanup",
   );
 });
+
+test("keeps a mine accident private while the shared ad-revival decision is pending", async () => {
+  const migrationsDirectory = new URL("../drizzle/", import.meta.url);
+  const migrationNames = (await readdir(migrationsDirectory)).filter((name) => name.endsWith(".sql"));
+  const migrationSources = await Promise.all(
+    migrationNames.map((name) => readFile(new URL(name, migrationsDirectory), "utf8")),
+  );
+  const [rooms, schema] = await Promise.all([
+    readFile(new URL("../lib/rooms.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
+  ]);
+
+  const publicRevivalStart = rooms.indexOf("function publicRevival");
+  const publicGameStart = rooms.indexOf("function publicGame", publicRevivalStart);
+  const toPublicRoomStart = rooms.indexOf("async function toPublicRoom", publicGameStart);
+  const actionStart = rooms.indexOf("export async function applyRoomAction");
+  assert.ok(publicRevivalStart >= 0 && publicGameStart > publicRevivalStart);
+  assert.ok(toPublicRoomStart > publicGameStart && actionStart >= 0);
+
+  const publicRevivalSource = rooms.slice(publicRevivalStart, publicGameStart);
+  const publicGameSource = rooms.slice(publicGameStart, toPublicRoomStart);
+  const actionSource = rooms.slice(actionStart);
+  const accidentStart = actionSource.indexOf('if (before.status !== "lost" && after.status === "lost")');
+  const normalCommitStart = actionSource.indexOf("const activityType = actionActivity", accidentStart);
+  assert.ok(accidentStart >= 0 && normalCommitStart > accidentStart);
+  const accidentSource = actionSource.slice(accidentStart, normalCommitStart);
+
+  assert.match(rooms, /const REVIVAL_AD_MS = 10_000/);
+  assert.match(rooms, /type RoomIncident = \{[\s\S]{0,500}action: LosingWireAction/);
+  assert.match(schema, /incidentJson: text\("incident_json"\)/);
+  assert.ok(
+    migrationSources.some((source) => /ALTER TABLE [`"]rooms[`"] ADD [`"]incident_json[`"] TEXT/i.test(source)),
+    "expected a migration that persists the private incident",
+  );
+
+  // The saved reveal/chord is intentionally server-only. The public DTO exposes
+  // who caused the pause and its deadline, but never the action/index.
+  assert.match(publicRevivalSource, /phase: incident\.phase/);
+  assert.match(publicRevivalSource, /adEndsAt: incident\.adEndsAt/);
+  assert.doesNotMatch(publicRevivalSource, /\baction\b|\bindex\b/);
+  assert.match(publicGameSource, /const terminal = game\.status === "won" \|\| game\.status === "lost"/);
+  assert.match(publicGameSource, /if \(terminal && cell\.isMine\) dto\.mine = true/);
+
+  // Detecting a loss records only the incident. Omitting game_json from this
+  // compare-and-swap is what leaves every client on the exact pre-mine board.
+  assert.match(accidentSource, /phase: "prompt"/);
+  assert.match(accidentSource, /action: \{ type: wireAction\.type, index: wireAction\.index \}/);
+  assert.match(accidentSource, /newActivity\(player, "incident", "踩雷了，等待场上玩家选择"\)/);
+  assert.doesNotMatch(accidentSource, /等待全员选择/);
+  assert.match(accidentSource, /incident_json = \?1/);
+  assert.doesNotMatch(accidentSource, /game_json\s*=/);
+});
+
+test("enforces the ten-second all-player ad and resolves it atomically", async () => {
+  const rooms = await readFile(new URL("../lib/rooms.ts", import.meta.url), "utf8");
+  const settleStart = rooms.indexOf("async function settleExpiredIncident");
+  const settleEnd = rooms.indexOf("function validateIndex", settleStart);
+  const actionStart = rooms.indexOf("export async function applyRoomAction");
+  assert.ok(settleStart >= 0 && settleEnd > settleStart && actionStart >= 0);
+  const settleSource = rooms.slice(settleStart, settleEnd);
+  const actionSource = rooms.slice(actionStart);
+  const spectatorGuard = actionSource.indexOf('identity.role === "spectator"');
+  const incidentRead = actionSource.indexOf("const incident = parseIncident(row)");
+
+  assert.ok(spectatorGuard >= 0 && incidentRead > spectatorGuard, "spectators must be rejected before any revival branch");
+  assert.match(actionSource, /identity\.role === "spectator"[\s\S]{0,180}403/);
+  assert.match(actionSource, /newActivity\(player, "ad", "所有参赛玩家观看 10 秒广告"\)/);
+  assert.doesNotMatch(actionSource, /newActivity\(player, "ad", "(?:全员|全房间)/);
+  assert.match(actionSource, /row = await settleExpiredIncident\(row, requestedAt\)/);
+  assert.match(actionSource, /wireAction\.type === "watchAd"[\s\S]{0,900}phase: "ad"[\s\S]{0,160}adEndsAt: now \+ REVIVAL_AD_MS/);
+  assert.match(actionSource, /if \(incident\.phase === "ad"\)[\s\S]{0,180}409/);
+  assert.match(actionSource, /translateAction\(incident\.action, before\)/);
+  assert.match(actionSource, /after\.status !== "lost"/);
+  assert.match(actionSource, /game_json = \?1, incident_json = NULL/);
+  assert.match(actionSource, /throw new RoomError\([\s\S]{0,180}409\);[\s\S]{0,120}if \(wireAction\.type === "watchAd" \|\| wireAction\.type === "endGame"\)/);
+
+  assert.match(settleSource, /incident\.phase !== "ad"/);
+  assert.match(settleSource, /requestedAt < incident\.adEndsAt/);
+  assert.match(settleSource, /shiftStartedAtForPause\(parseGame\(row\), incident, now\)/);
+  assert.match(settleSource, /revision: pausedGame\.revision \+ 1/);
+  assert.match(settleSource, /game_json = \?1, incident_json = NULL/);
+  assert.match(settleSource, /WHERE code = \?5 AND version = \?6 AND incident_json = \?7/);
+});
+
+test("renders the shared revival prompt, player-only ad, spectator countdown, and board lock", async () => {
+  const [app, css] = await Promise.all([
+    readFile(new URL("../app/MinefieldApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(app, /\{ type: "watchAd" \}/);
+  assert.match(app, /\{ type: "endGame" \}/);
+  assert.match(app, /const isRevivalLocked = Boolean\(revival\)/);
+  assert.match(app, /disabled=\{isSpectator \|\| isRevivalLocked \|\| room\.game\.status === "won" \|\| room\.game\.status === "lost"\}/);
+  assert.match(app, /className=\{`revival-overlay revival-\$\{revival\.phase\}`\}/);
+  assert.match(app, /submitRevivalDecision\("watchAd"\)/);
+  assert.match(app, /submitRevivalDecision\("endGame"\)/);
+  assert.match(app, /看广告复活/);
+  assert.match(app, /结束游戏/);
+  assert.match(app, /广告播放中/);
+  assert.match(app, /广告位招租中/);
+  assert.match(app, /所有参赛玩家就得一起看/);
+  assert.match(app, /所有参赛玩家被迫观看/);
+  assert.match(app, /旁观席免广告/);
+  assert.match(app, /场上玩家正在看广告；旁观者免广告，可继续聊天围观。/);
+  assert.doesNotMatch(app, /全房间就得一起看|全房间被迫观看|全房同步/);
+  assert.match(app, /Math\.ceil\(\(revival\.adEndsAt - now\) \/ 1000\)/);
+  assert.match(app, /Math\.min\(10,/);
+  assert.match(app, /if \(isSpectator \|\| room\?\.revival\?\.phase !== "prompt" \|\| revivalDecision\) return/);
+
+  const spectatorPromptStart = app.indexOf('<div className="revival-spectator-wait">');
+  const playerPromptStart = app.indexOf('<div className="revival-actions">', spectatorPromptStart);
+  const spectatorAdStart = app.indexOf("<span>GAME PAUSED</span>", playerPromptStart);
+  const playerAdStart = app.indexOf("<span>AD BREAK</span>", spectatorAdStart);
+  assert.ok(
+    spectatorPromptStart >= 0
+      && playerPromptStart > spectatorPromptStart
+      && spectatorAdStart > playerPromptStart
+      && playerAdStart > spectatorAdStart,
+    "expected separate spectator/player prompt and ad branches",
+  );
+  const spectatorPromptSource = app.slice(spectatorPromptStart, playerPromptStart);
+  const spectatorAdSource = app.slice(spectatorAdStart, playerAdStart);
+  assert.doesNotMatch(spectatorPromptSource, /<button|watchAd|endGame/);
+  assert.match(spectatorAdSource, /revival-countdown spectator-countdown/);
+  assert.doesNotMatch(spectatorAdSource, /revival-watch-button|revival-end-button|ad-rental|YOUR AD HERE/);
+  assert.match(css, /\.revival-overlay/);
+  assert.match(css, /\.revival-countdown/);
+  assert.match(css, /\.revival-watch-button/);
+  assert.match(css, /\.revival-end-button/);
+});

@@ -51,3 +51,32 @@ test("zero flood fill skips flagged cells without getting stuck", () => {
   assert.equal(flooded.revealedSafeCells, 14);
   assert.equal(flooded.status, "playing");
 });
+
+test("a mine accident can be rolled back to the exact playable snapshot and replayed as a loss", () => {
+  const blank = createGame({ width: 3, height: 3, mineCount: 1 });
+  const beforeAccident = revealCell(blank, 1, 1, {
+    random: () => 0,
+    now: () => 1000,
+    actorId: "p1",
+  });
+
+  assert.equal(beforeAccident.status, "playing");
+  assert.equal(beforeAccident.cells[0].isMine, true);
+  const snapshot = JSON.stringify(beforeAccident);
+
+  const accident = revealCell(beforeAccident, 0, 0, { now: () => 2000, actorId: "p2" });
+  assert.equal(accident.status, "lost");
+  assert.equal(accident.cells[0].isExploded, true);
+
+  // The revival prompt must publish and persist this pre-accident state, not the
+  // terminal result (which would leak the mine layout to every client).
+  assert.equal(JSON.stringify(beforeAccident), snapshot);
+  assert.equal(beforeAccident.cells.some((cell) => cell.isExploded), false);
+  const continued = revealCell(beforeAccident, 2, 2, { now: () => 3000, actorId: "p1" });
+  assert.notEqual(continued.status, "lost");
+
+  // Choosing "end game" is deliberately modeled by replaying the saved action.
+  const replayedAccident = revealCell(beforeAccident, 0, 0, { now: () => 4000, actorId: "p2" });
+  assert.equal(replayedAccident.status, "lost");
+  assert.equal(replayedAccident.cells[0].isExploded, true);
+});

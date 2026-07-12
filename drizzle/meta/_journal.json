@@ -36,6 +36,13 @@
       "when": 1783810245908,
       "tag": "0004_spotty_pixie",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1783837114041,
+      "tag": "0005_burly_champions",
+      "breakpoints": true
     }
   ]
 }

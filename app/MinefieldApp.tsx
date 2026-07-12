@@ -64,6 +64,14 @@ type Activity = {
   createdAt: number;
 };
 
+type Revival = {
+  phase: "prompt" | "ad";
+  triggeredById: string;
+  triggeredByName: string;
+  createdAt: number;
+  adEndsAt: number | null;
+};
+
 type Room = {
   code: string;
   version: number;
@@ -72,6 +80,7 @@ type Room = {
   spectators?: RoomSpectator[];
   chat?: ChatMessage[];
   activity: Activity[];
+  revival?: Revival | null;
   updatedAt: number;
 };
 
@@ -88,7 +97,9 @@ type GameAction =
   | { type: "mark"; index: number; state: "hidden" | "flagged" | "questioned" }
   | { type: "chord"; index: number }
   | { type: "restart" }
-  | { type: "changeDifficulty"; difficulty: Difficulty };
+  | { type: "changeDifficulty"; difficulty: Difficulty }
+  | { type: "watchAd" }
+  | { type: "endGame" };
 
 const DIFFICULTIES: Record<Difficulty, { label: string; meta: string }> = {
   beginner: { label: "初级", meta: "9×9 · 10 雷" },
@@ -139,6 +150,15 @@ function activityCopy(item: Activity) {
     difficulty: `把难度改成${item.detail ?? "新难度"}`,
     win: "完成最后一击，清空雷区",
     boom: item.detail ? `在 ${item.detail} 引爆了雷` : "引爆了雷",
+    incident: item.detail ?? "踩雷了，等待场上玩家选择",
+    accident: item.detail ? `在 ${item.detail} 制造了一起雷区事故` : "制造了一起雷区事故",
+    revival_prompt: "踩雷后触发了场上玩家友谊急救",
+    watch_ad: "选择看广告，拉所有参赛玩家一起坐牢",
+    ad: "选择看广告，拉所有参赛玩家一起坐牢",
+    revive: "看完广告，成功把时间倒带",
+    revived: "看完广告，成功把时间倒带",
+    end_game: "放弃广告急救，决定结束游戏",
+    end: item.detail ?? "放弃广告急救，决定结束游戏",
   };
   return map[item.type] ?? item.detail ?? "更新了棋盘";
 }
@@ -167,6 +187,7 @@ export function MinefieldApp() {
   const [tapMode, setTapMode] = useState<"reveal" | "mark">("reveal");
   const [chatDraft, setChatDraft] = useState("");
   const [sendingChat, setSendingChat] = useState(false);
+  const [revivalDecision, setRevivalDecision] = useState<"watchAd" | "endGame" | null>(null);
   const [chordPreviewIndex, setChordPreviewIndex] = useState<number | null>(null);
   const [now, setNow] = useState(0);
   const roomRef = useRef<Room | null>(null);
@@ -284,10 +305,20 @@ export function MinefieldApp() {
   }, [latestChatId]);
 
   useEffect(() => {
-    if (room?.game.status !== "playing") return;
+    if (room?.game.status !== "playing" && room?.revival?.phase !== "ad") return;
     const timer = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(timer);
-  }, [room?.game.status]);
+  }, [room?.game.status, room?.revival?.phase]);
+
+  useEffect(() => {
+    if (!room?.revival?.createdAt) return;
+    if (longPressTimer.current) clearTimeout(longPressTimer.current);
+    longPressTimer.current = null;
+    longPressedIndex.current = null;
+    chordGestureIndex.current = null;
+    const frame = window.requestAnimationFrame(() => setChordPreviewIndex(null));
+    return () => window.cancelAnimationFrame(frame);
+  }, [room?.revival?.createdAt]);
 
   useEffect(() => {
     if (!notice) return;
@@ -322,6 +353,7 @@ export function MinefieldApp() {
     setPausedSession(null);
     setChatDraft("");
     setSendingChat(false);
+    setRevivalDecision(null);
     setSession(next);
   };
 
@@ -385,6 +417,7 @@ export function MinefieldApp() {
     setJoinCode("");
     setChatDraft("");
     setSendingChat(false);
+    setRevivalDecision(null);
     setError("");
   };
 
@@ -397,8 +430,11 @@ export function MinefieldApp() {
 
   const commitAction = useCallback((action: GameAction) => {
     const activeSession = sessionRef.current;
-    if (!activeSession || activeSession.role === "spectator") return;
-    actionQueue.current = actionQueue.current.then(async () => {
+    if (!activeSession || activeSession.role === "spectator") return Promise.resolve();
+    const activeRevival = roomRef.current?.revival;
+    const isRevivalDecision = action.type === "watchAd" || action.type === "endGame";
+    if ((activeRevival && !isRevivalDecision) || (!activeRevival && isRevivalDecision)) return Promise.resolve();
+    return actionQueue.current = actionQueue.current.then(async () => {
       try {
         const response = await fetch(`/api/rooms/${activeSession.code}`, {
           method: "POST",
@@ -421,6 +457,14 @@ export function MinefieldApp() {
       }
     });
   }, [acceptRoom, fetchRoom]);
+
+  const submitRevivalDecision = (decision: "watchAd" | "endGame") => {
+    if (isSpectator || room?.revival?.phase !== "prompt" || revivalDecision) return;
+    setRevivalDecision(decision);
+    void commitAction({ type: decision }).finally(() => {
+      setRevivalDecision((current) => current === decision ? null : current);
+    });
+  };
 
   const sendChat = async (event: FormEvent) => {
     event.preventDefault();
@@ -534,7 +578,13 @@ export function MinefieldApp() {
   };
 
   const status = room ? statusCopy(room.game, room.players) : null;
-  const seconds = room ? secondsFor(room.game, now) : 0;
+  const revival = room?.revival ?? null;
+  const isRevivalLocked = Boolean(revival);
+  const seconds = room ? secondsFor(room.game, revival?.createdAt ?? now) : 0;
+  const adSecondsRemaining = revival?.phase === "ad" && revival.adEndsAt
+    ? Math.max(0, Math.min(10, Math.ceil((revival.adEndsAt - now) / 1000)))
+    : 10;
+  const isAdFinished = revival?.phase === "ad" && revival.adEndsAt !== null && now >= revival.adEndsAt;
   const currentDifficulty = room?.game.difficulty ?? difficulty;
   const isSpectator = (session?.role ?? "player") === "spectator";
   const me = room?.players.find((player) => player.id === session?.playerId);
@@ -647,11 +697,11 @@ export function MinefieldApp() {
             </div>
           </div>
 
-          <section className={`mine-console status-${room.game.status}`} aria-label="扫雷棋盘">
+          <section className={`mine-console status-${room.game.status}${isRevivalLocked ? " revival-active" : ""}`} aria-label="扫雷棋盘">
             <div className="classic-display">
               <div className="digit-box"><small>剩余雷数</small><strong>{formatCounter(room.game.mines - room.game.flags)}</strong></div>
-              <button className="face-button" onClick={() => commitAction({ type: "restart" })} aria-label={isSpectator ? "旁观模式，不能重新开始" : "重新开始"} disabled={isSpectator}>
-                {room.game.status === "lost" ? "×_×" : room.game.status === "won" ? "^‿^" : room.game.status === "playing" ? "•_•" : "•‿•"}
+              <button className="face-button" onClick={() => commitAction({ type: "restart" })} aria-label={isSpectator ? "旁观模式，不能重新开始" : isRevivalLocked ? "事故处理中，暂时不能重新开始" : "重新开始"} disabled={isSpectator || isRevivalLocked}>
+                {isRevivalLocked ? "⊙_⊙" : room.game.status === "lost" ? "×_×" : room.game.status === "won" ? "^‿^" : room.game.status === "playing" ? "•_•" : "•‿•"}
               </button>
               <div className="digit-box align-right"><small>用时</small><strong>{formatCounter(seconds)}</strong></div>
             </div>
@@ -676,7 +726,7 @@ export function MinefieldApp() {
                       className={`mine-cell ${stateClass}`}
                       role="gridcell"
                       aria-label={label}
-                      disabled={isSpectator || room.game.status === "won" || room.game.status === "lost"}
+                      disabled={isSpectator || isRevivalLocked || room.game.status === "won" || room.game.status === "lost"}
                       onClick={() => handleCellClick(cell)}
                       onDoubleClick={(event) => { event.preventDefault(); if (cell.state === "revealed") commitAction({ type: "chord", index: cell.index }); }}
                       onMouseDown={(event) => beginClassicChord(event, cell)}
@@ -699,10 +749,72 @@ export function MinefieldApp() {
             </div>
 
             {!isSpectator && (
-              <div className="mobile-mode" role="group" aria-label="触屏操作模式">
-                <button className={tapMode === "reveal" ? "active" : ""} onClick={() => setTapMode("reveal")}>轻触排雷</button>
-                <button className={tapMode === "mark" ? "active" : ""} onClick={() => setTapMode("mark")}>轻触标记</button>
+              <div className={`mobile-mode${isRevivalLocked ? " locked" : ""}`} role="group" aria-label="触屏操作模式">
+                <button className={tapMode === "reveal" ? "active" : ""} disabled={isRevivalLocked} onClick={() => setTapMode("reveal")}>轻触排雷</button>
+                <button className={tapMode === "mark" ? "active" : ""} disabled={isRevivalLocked} onClick={() => setTapMode("mark")}>轻触标记</button>
                 <span>也可长按插旗</span>
+              </div>
+            )}
+
+            {revival && (
+              <div className={`revival-overlay revival-${revival.phase}`} role="dialog" aria-modal="false" aria-labelledby="revival-title">
+                <div className="revival-card">
+                  {revival.phase === "prompt" ? (
+                    <>
+                      <div className="revival-warning"><span aria-hidden="true">!</span> FRIENDSHIP EMERGENCY</div>
+                      <div className="revival-accident-icon" aria-hidden="true">✹</div>
+                      <p className="revival-culprit"><strong>{revival.triggeredByName}</strong> 刚刚非常精准地踩中了雷</p>
+                      <h2 id="revival-title">这段友谊还有抢救价值吗？</h2>
+                      <p className="revival-explainer">只要有一位玩家选择看广告，所有参赛玩家就得一起看，然后棋盘会回到踩雷前。</p>
+                      {isSpectator ? (
+                        <div className="revival-spectator-wait">
+                          <span className="waiting-dots" aria-hidden="true"><i /><i /><i /></span>
+                          <p>等待场上玩家决定。旁观席暂时只有起哄权，没有生杀大权。</p>
+                        </div>
+                      ) : (
+                        <div className="revival-actions">
+                          <button className="revival-watch-button" type="button" disabled={Boolean(revivalDecision)} onClick={() => submitRevivalDecision("watchAd")}>
+                            <span>{revivalDecision === "watchAd" ? "正在召集所有参赛玩家…" : "看广告复活"}</span><b aria-hidden="true">▶</b>
+                          </button>
+                          <p className="ad-rental">（广告位招租中……）</p>
+                          <button className="revival-end-button" type="button" disabled={Boolean(revivalDecision)} onClick={() => submitRevivalDecision("endGame")}>
+                            {revivalDecision === "endGame" ? "正在结束本局…" : "结束游戏"}
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  ) : isSpectator ? (
+                    <>
+                      <div className="revival-ad-label"><span>GAME PAUSED</span><b>旁观提示</b></div>
+                      <p className="revival-forced spectator-copy">场上玩家正在看广告</p>
+                      <h2 id="revival-title">{isAdFinished ? "棋盘即将恢复" : "旁观席免广告"}</h2>
+                      <p className="revival-spectator-free">{isAdFinished ? "场上玩家正在复活；旁观者可以继续聊天围观。" : "场上玩家正在看广告；旁观者免广告，可继续聊天围观。"}</p>
+                      <div className={`revival-countdown spectator-countdown${isAdFinished ? " finished" : ""}`} aria-live="polite" aria-label={`场上游戏预计 ${adSecondsRemaining} 秒后恢复`}>
+                        <strong>{adSecondsRemaining}</strong><small>秒后继续</small>
+                      </div>
+                      <div className="revival-spectator-perk">
+                        <span aria-hidden="true">◉</span><div><b>免广告旁观通道</b><small>棋盘暂停不耽误聊天区继续起哄</small></div>
+                      </div>
+                      <p className="revival-no-skip">{isAdFinished ? "服务器正在恢复场上棋盘，请稍候……" : "你没有复活选择权，但也没有陪看广告的义务。"}</p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="revival-ad-label"><span>AD BREAK</span><b>场上同步</b></div>
+                      <p className="revival-forced">所有参赛玩家被迫观看</p>
+                      <h2 id="revival-title">{isAdFinished ? "正在复活" : "广告播放中"}</h2>
+                      <p className="ad-rental">（广告位招租中……）</p>
+                      <div className={`revival-countdown${isAdFinished ? " finished" : ""}`} aria-live="polite" aria-label={`广告剩余 ${adSecondsRemaining} 秒`}>
+                        <strong>{adSecondsRemaining}</strong><small>秒</small>
+                      </div>
+                      <div className="revival-ad-space" aria-hidden="true">
+                        <span>YOUR AD HERE</span>
+                        <b>本广告位可精准触达<br />正在互相甩锅的高净值好友</b>
+                        <i>商务合作 · 请在聊天区自行报价</i>
+                      </div>
+                      <p className="revival-no-skip">{isAdFinished ? "服务器正在把场上棋盘拨回踩雷前，请稍候……" : "无法跳过：你的朋友已经替你做了决定。"}</p>
+                    </>
+                  )}
+                </div>
               </div>
             )}
           </section>
@@ -803,10 +915,10 @@ export function MinefieldApp() {
             ) : (
               <>
                 <label htmlFor="game-difficulty">难度</label>
-                <select id="game-difficulty" value={currentDifficulty} onChange={(event) => commitAction({ type: "changeDifficulty", difficulty: event.target.value as Difficulty })}>
+                <select id="game-difficulty" value={currentDifficulty} disabled={isRevivalLocked} onChange={(event) => commitAction({ type: "changeDifficulty", difficulty: event.target.value as Difficulty })}>
                   {(Object.keys(DIFFICULTIES) as Difficulty[]).map((key) => <option value={key} key={key}>{DIFFICULTIES[key].label} · {DIFFICULTIES[key].meta}</option>)}
                 </select>
-                <button className="restart-button" onClick={() => commitAction({ type: "restart" })}>重新布置雷区</button>
+                <button className="restart-button" disabled={isRevivalLocked} onClick={() => commitAction({ type: "restart" })}>重新布置雷区</button>
               </>
             )}
             <button className="leave-button" onClick={leaveRoom}>{isSpectator ? "离开旁观席" : "暂时离开房间"}</button>

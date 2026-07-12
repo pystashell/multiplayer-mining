@@ -19,6 +19,7 @@ const MAX_CHAT_MESSAGES = 100;
 const RETURNED_CHAT_MESSAGES = 40;
 const CHAT_RATE_LIMIT = 8;
 const CHAT_RATE_WINDOW_MS = 30_000;
+const REVIVAL_AD_MS = 10_000;
 
 const CREATE_ROOMS_SQL = `
   CREATE TABLE IF NOT EXISTS rooms (
@@ -26,6 +27,7 @@ const CREATE_ROOMS_SQL = `
     version INTEGER NOT NULL DEFAULT 1,
     game_json TEXT NOT NULL,
     activity_json TEXT NOT NULL DEFAULT '[]',
+    incident_json TEXT,
     host_id TEXT NOT NULL,
     host_name TEXT NOT NULL,
     host_token_hash TEXT NOT NULL,
@@ -118,7 +120,7 @@ const CREATE_MESSAGES_SENDER_INDEX_SQL = `
   ON room_messages (sender_id, created_at)
 `;
 
-const ROOM_CAPACITY_COLUMNS = [
+const ROOM_COMPATIBILITY_COLUMNS = [
   ["player3_id", "ALTER TABLE rooms ADD COLUMN player3_id TEXT"],
   ["player3_name", "ALTER TABLE rooms ADD COLUMN player3_name TEXT"],
   ["player3_token_hash", "ALTER TABLE rooms ADD COLUMN player3_token_hash TEXT"],
@@ -127,6 +129,7 @@ const ROOM_CAPACITY_COLUMNS = [
   ["player4_name", "ALTER TABLE rooms ADD COLUMN player4_name TEXT"],
   ["player4_token_hash", "ALTER TABLE rooms ADD COLUMN player4_token_hash TEXT"],
   ["player4_seen_at", "ALTER TABLE rooms ADD COLUMN player4_seen_at INTEGER"],
+  ["incident_json", "ALTER TABLE rooms ADD COLUMN incident_json TEXT"],
 ] as const;
 
 type RoomRow = {
@@ -134,6 +137,7 @@ type RoomRow = {
   version: number;
   game_json: string;
   activity_json: string;
+  incident_json: string | null;
   host_id: string;
   host_name: string;
   host_token_hash: string;
@@ -232,6 +236,13 @@ export type PublicRoom = {
     content: string;
     createdAt: number;
   }>;
+  revival: {
+    phase: "prompt" | "ad";
+    triggeredById: string;
+    triggeredByName: string;
+    createdAt: number;
+    adEndsAt: number | null;
+  } | null;
   activity: RoomActivity[];
   updatedAt: number;
 };
@@ -257,7 +268,21 @@ export type WireAction =
   | { type: "mark"; index: number; state: "hidden" | "flagged" | "questioned" }
   | { type: "chord"; index: number }
   | { type: "restart" }
-  | { type: "changeDifficulty"; difficulty: Difficulty };
+  | { type: "changeDifficulty"; difficulty: Difficulty }
+  | { type: "watchAd" }
+  | { type: "endGame" };
+
+type BoardWireAction = Exclude<WireAction, { type: "watchAd" | "endGame" }>;
+type LosingWireAction = Extract<WireAction, { type: "reveal" | "chord" }>;
+
+type RoomIncident = {
+  phase: "prompt" | "ad";
+  triggeredById: string;
+  triggeredByName: string;
+  action: LosingWireAction;
+  createdAt: number;
+  adEndsAt: number | null;
+};
 
 type AuthorizedPlayer = {
   id: string;
@@ -316,7 +341,7 @@ function database() {
 async function ensureRoomCapacityColumns(db: D1Database) {
   const current = await db.prepare("PRAGMA table_info(rooms)").run<{ name: string }>();
   const existing = new Set(current.results.map((column) => column.name));
-  const missing = ROOM_CAPACITY_COLUMNS.filter(([name]) => !existing.has(name));
+  const missing = ROOM_COMPATIBILITY_COLUMNS.filter(([name]) => !existing.has(name));
   if (missing.length === 0) return;
 
   try {
@@ -324,7 +349,7 @@ async function ensureRoomCapacityColumns(db: D1Database) {
   } catch (error) {
     const verified = await db.prepare("PRAGMA table_info(rooms)").run<{ name: string }>();
     const finalColumns = new Set(verified.results.map((column) => column.name));
-    if (!ROOM_CAPACITY_COLUMNS.every(([name]) => finalColumns.has(name))) throw error;
+    if (!ROOM_COMPATIBILITY_COLUMNS.every(([name]) => finalColumns.has(name))) throw error;
   }
 }
 
@@ -491,6 +516,50 @@ function parseActivity(row: RoomRow) {
   }
 }
 
+function parseIncident(row: RoomRow): RoomIncident | null {
+  if (!row.incident_json) return null;
+
+  try {
+    const value = JSON.parse(row.incident_json) as Partial<RoomIncident>;
+    const action = value.action;
+    const validAction = action
+      && (action.type === "reveal" || action.type === "chord")
+      && Number.isSafeInteger(action.index)
+      && action.index >= 0;
+    const validPhase = value.phase === "prompt" || value.phase === "ad";
+    const validAdEnd = value.phase === "prompt"
+      ? value.adEndsAt === null
+      : typeof value.adEndsAt === "number" && Number.isFinite(value.adEndsAt);
+
+    if (
+      !validAction
+      || !validPhase
+      || !validAdEnd
+      || typeof value.triggeredById !== "string"
+      || typeof value.triggeredByName !== "string"
+      || typeof value.createdAt !== "number"
+      || !Number.isFinite(value.createdAt)
+    ) {
+      throw new Error("Invalid room incident");
+    }
+
+    return value as RoomIncident;
+  } catch {
+    throw new RoomError("房间的复活状态异常，请稍后再试。", 500);
+  }
+}
+
+function publicRevival(incident: RoomIncident | null): PublicRoom["revival"] {
+  if (!incident) return null;
+  return {
+    phase: incident.phase,
+    triggeredById: incident.triggeredById,
+    triggeredByName: incident.triggeredByName,
+    createdAt: incident.createdAt,
+    adEndsAt: incident.adEndsAt,
+  };
+}
+
 function publicGame(game: GameState): PublicRoom["game"] {
   const terminal = game.status === "won" || game.status === "lost";
   const difficulty = game.difficulty in DIFFICULTY_PRESETS ? game.difficulty as Difficulty : "beginner";
@@ -588,6 +657,7 @@ async function toPublicRoom(row: RoomRow, now = Date.now()): Promise<PublicRoom>
     players,
     spectators,
     chat,
+    revival: publicRevival(parseIncident(row)),
     activity: parseActivity(row),
     updatedAt: row.updated_at,
   };
@@ -678,6 +748,61 @@ function coordinateLabel(index: number, width: number) {
   return `${column}${row}`;
 }
 
+function shiftStartedAtForPause(game: GameState, incident: RoomIncident, settledAt: number) {
+  if (game.startedAt === null) return game;
+  return {
+    ...game,
+    startedAt: game.startedAt + Math.max(0, settledAt - incident.createdAt),
+  };
+}
+
+async function settleExpiredIncident(initialRow: RoomRow, requestedAt = Date.now()) {
+  let row = initialRow;
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const incident = parseIncident(row);
+    if (
+      !incident
+      || incident.phase !== "ad"
+      || incident.adEndsAt === null
+      || requestedAt < incident.adEndsAt
+    ) {
+      return row;
+    }
+
+    const now = Math.max(requestedAt, Date.now());
+    const pausedGame = shiftStartedAtForPause(parseGame(row), incident, now);
+    const resumedGame = { ...pausedGame, revision: pausedGame.revision + 1 };
+    const activity = [
+      newActivity(
+        { id: incident.triggeredById, name: incident.triggeredByName },
+        "revive",
+        "广告结束，棋盘已恢复",
+      ),
+      ...parseActivity(row),
+    ].slice(0, MAX_ACTIVITY);
+    const result = await database().prepare(`
+      UPDATE rooms SET
+        game_json = ?1, incident_json = NULL, activity_json = ?2,
+        version = version + 1, updated_at = ?3, expires_at = ?4
+      WHERE code = ?5 AND version = ?6 AND incident_json = ?7
+    `).bind(
+      JSON.stringify(resumedGame),
+      JSON.stringify(activity),
+      now,
+      now + ROOM_TTL_MS,
+      row.code,
+      row.version,
+      row.incident_json,
+    ).run();
+
+    if ((result.meta.changes ?? 0) === 1) return readRoom(row.code);
+    row = await readRoom(row.code);
+  }
+
+  throw new RoomError("队友刚好也完成了复活，房间正在刷新，请再试一次。", 409);
+}
+
 function validateIndex(index: unknown, game: GameState) {
   if (!Number.isSafeInteger(index) || (index as number) < 0 || (index as number) >= game.cells.length) {
     throw new RoomError("这个格子不在棋盘里。", 400);
@@ -685,7 +810,7 @@ function validateIndex(index: unknown, game: GameState) {
   return index as number;
 }
 
-function translateAction(action: WireAction, game: GameState): { engine: GameAction; detail?: string } {
+function translateAction(action: BoardWireAction, game: GameState): { engine: GameAction; detail?: string } {
   if (!action || typeof action !== "object" || typeof action.type !== "string") throw new RoomError("无法识别这一步。", 400);
   if (action.type === "restart") return { engine: { type: "restart" } };
   if (action.type === "changeDifficulty") {
@@ -705,7 +830,7 @@ function translateAction(action: WireAction, game: GameState): { engine: GameAct
   return { engine: { type: action.type, x, y } as GameAction, detail: coordinateLabel(index, game.width) };
 }
 
-function actionActivity(before: GameState, after: GameState, wire: WireAction, detail?: string) {
+function actionActivity(before: GameState, after: GameState, wire: BoardWireAction, detail?: string) {
   if (before.status !== "lost" && after.status === "lost") return { type: "boom", detail };
   if (before.status !== "won" && after.status === "won") return { type: "win", detail };
   if (wire.type === "mark") {
@@ -835,16 +960,18 @@ export async function joinAsSpectator(codeInput: string, input: { name: unknown 
 }
 
 export async function getRoom(codeInput: string, token: string | null) {
-  const row = await readRoom(codeInput);
+  let row = await readRoom(codeInput);
   const identity = await authenticate(row, token);
+  row = await settleExpiredIncident(row);
   await touchPresence(row, identity);
   return { room: await toPublicRoom(row) };
 }
 
 export async function postRoomMessage(codeInput: string, token: string | null, contentInput: unknown) {
   const content = normalizeChatContent(contentInput);
-  const row = await readRoom(codeInput);
+  let row = await readRoom(codeInput);
   const identity = await authenticate(row, token);
+  row = await settleExpiredIncident(row);
   await touchPresence(row, identity);
   await enforceChatRateLimit(identity.id);
 
@@ -888,23 +1015,154 @@ export async function postRoomMessage(codeInput: string, token: string | null, c
 }
 
 export async function applyRoomAction(codeInput: string, token: string | null, wireAction: WireAction) {
+  if (!wireAction || typeof wireAction !== "object" || typeof wireAction.type !== "string") {
+    throw new RoomError("无法识别这一步。", 400);
+  }
+
   const db = database();
   const maxAttempts = wireAction.type === "restart" ? 1 : 3;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const row = await readRoom(codeInput);
+    let row = await readRoom(codeInput);
     const identity = await authenticate(row, token);
     if (identity.role === "spectator") throw new RoomError("旁观者不能操作雷区。", 403);
     const player = identity;
+    await touchPresence(row, player);
+
+    const requestedAt = Date.now();
+    row = await settleExpiredIncident(row, requestedAt);
+    const incident = parseIncident(row);
+
+    if (incident) {
+      if (wireAction.type === "watchAd") {
+        if (incident.phase === "ad") return { room: await toPublicRoom(row, requestedAt) };
+
+        const now = Date.now();
+        const watching: RoomIncident = {
+          ...incident,
+          phase: "ad",
+          adEndsAt: now + REVIVAL_AD_MS,
+        };
+        const activity = [
+          newActivity(player, "ad", "所有参赛玩家观看 10 秒广告"),
+          ...parseActivity(row),
+        ].slice(0, MAX_ACTIVITY);
+        const result = await db.prepare(`
+          UPDATE rooms SET
+            incident_json = ?1, activity_json = ?2, version = version + 1,
+            updated_at = ?3, expires_at = ?4
+          WHERE code = ?5 AND version = ?6 AND incident_json = ?7
+        `).bind(
+          JSON.stringify(watching),
+          JSON.stringify(activity),
+          now,
+          now + ROOM_TTL_MS,
+          row.code,
+          row.version,
+          row.incident_json,
+        ).run();
+
+        if ((result.meta.changes ?? 0) === 1) {
+          const latest = await readRoom(row.code);
+          return { room: await toPublicRoom(latest, now) };
+        }
+        continue;
+      }
+
+      if (wireAction.type === "endGame") {
+        if (incident.phase === "ad") {
+          throw new RoomError("广告已经开始了，大家看完就能继续扫雷。", 409);
+        }
+
+        const now = Date.now();
+        const before = shiftStartedAtForPause(parseGame(row), incident, now);
+        const translated = translateAction(incident.action, before);
+        const after = reduceGameAction(before, translated.engine, {
+          actorId: incident.triggeredById,
+          now: () => now,
+        });
+        if (before.status === "lost" || after.status !== "lost") {
+          throw new RoomError("这次踩雷已经无法重放，请重新开局。", 409);
+        }
+
+        const activity = [
+          newActivity(player, "end", `${incident.triggeredByName} 踩雷，选择结束游戏`),
+          ...parseActivity(row),
+        ].slice(0, MAX_ACTIVITY);
+        const result = await db.prepare(`
+          UPDATE rooms SET
+            game_json = ?1, incident_json = NULL, activity_json = ?2,
+            version = version + 1, updated_at = ?3, expires_at = ?4
+          WHERE code = ?5 AND version = ?6 AND incident_json = ?7
+        `).bind(
+          JSON.stringify(after),
+          JSON.stringify(activity),
+          now,
+          now + ROOM_TTL_MS,
+          row.code,
+          row.version,
+          row.incident_json,
+        ).run();
+
+        if ((result.meta.changes ?? 0) === 1) {
+          const latest = await readRoom(row.code);
+          return { room: await toPublicRoom(latest, now) };
+        }
+        continue;
+      }
+
+      throw new RoomError("有人踩雷了，请先选择看广告复活或结束游戏。", 409);
+    }
+
+    if (wireAction.type === "watchAd" || wireAction.type === "endGame") {
+      throw new RoomError("现在没有需要处理的踩雷事故。", 409);
+    }
+
     const before = parseGame(row);
     const translated = translateAction(wireAction, before);
-    const after = reduceGameAction(before, translated.engine, { actorId: player.id });
-    await touchPresence(row, player);
+    const now = Date.now();
+    const after = reduceGameAction(before, translated.engine, { actorId: player.id, now: () => now });
     if (after === before) return { room: await toPublicRoom(row) };
+
+    if (before.status !== "lost" && after.status === "lost") {
+      if (wireAction.type !== "reveal" && wireAction.type !== "chord") {
+        throw new RoomError("无法识别这次踩雷事故。", 500);
+      }
+      const pending: RoomIncident = {
+        phase: "prompt",
+        triggeredById: player.id,
+        triggeredByName: player.name,
+        action: { type: wireAction.type, index: wireAction.index },
+        createdAt: now,
+        adEndsAt: null,
+      };
+      const activity = [
+        newActivity(player, "incident", "踩雷了，等待场上玩家选择"),
+        ...parseActivity(row),
+      ].slice(0, MAX_ACTIVITY);
+      const result = await db.prepare(`
+        UPDATE rooms SET
+          incident_json = ?1, activity_json = ?2, version = version + 1,
+          updated_at = ?3, expires_at = ?4
+        WHERE code = ?5 AND version = ?6 AND incident_json IS NULL
+      `).bind(
+        JSON.stringify(pending),
+        JSON.stringify(activity),
+        now,
+        now + ROOM_TTL_MS,
+        row.code,
+        row.version,
+      ).run();
+
+      if ((result.meta.changes ?? 0) === 1) {
+        const latest = await readRoom(row.code);
+        return { room: await toPublicRoom(latest, now) };
+      }
+      continue;
+    }
 
     const activityType = actionActivity(before, after, wireAction, translated.detail);
     const activity = [newActivity(player, activityType.type, activityType.detail), ...parseActivity(row)].slice(0, MAX_ACTIVITY);
-    const now = Date.now();
     const result = await db.prepare(`
       UPDATE rooms SET
         game_json = ?1, activity_json = ?2, version = version + 1,
