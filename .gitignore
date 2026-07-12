@@ -30,14 +30,20 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
 
-# typescript
+# generated types and build artifacts
 next-env.d.ts
+worker-configuration.d.ts
+cloudflare-env.d.ts
 *.tsbuildinfo
 /dist/
 /.wrangler/
 /outputs/
 /work/
+
+# local agent tooling
+/.agents/

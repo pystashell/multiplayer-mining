@@ -1,0 +1,46 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "multiplayer-mining",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-05-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "none"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MINE_ROOMS",
+        "class_name": "MineRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MineRoom"]
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "ROOM_CREATE_LIMIT",
+      "namespace_id": "31001",
+      "simple": { "limit": 6, "period": 60 }
+    },
+    {
+      "name": "ROOM_JOIN_LIMIT",
+      "namespace_id": "31002",
+      "simple": { "limit": 20, "period": 60 }
+    },
+    {
+      "name": "ROOM_SOCKET_LIMIT",
+      "namespace_id": "31003",
+      "simple": { "limit": 30, "period": 60 }
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
