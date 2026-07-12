@@ -471,7 +471,7 @@ a:focus-visible {
 
 .join-actions {
   display: grid;
-  grid-template-columns: 1fr .78fr;
+  grid-template-columns: 1fr 1.22fr;
   gap: 7px;
 }
 
@@ -500,11 +500,21 @@ a:focus-visible {
   border-color: #8b8b84;
   background: #e3e1d9;
   color: #4f5960;
-  font-size: 12px;
+  padding-inline: 8px;
+  font-size: 10px;
   font-weight: 800;
+  white-space: nowrap;
 }
 
 .spectate-button:hover { border-color: var(--ink); background: #d7d5cd; color: var(--ink); }
+
+.spectate-hint {
+  margin: 8px 0 0;
+  color: #777973;
+  font-size: 9px;
+  line-height: 1.5;
+  text-align: right;
+}
 
 .form-error {
   margin: 13px 0 0;
@@ -1180,6 +1190,47 @@ a:focus-visible {
 
 .board-help b { margin-right: 4px; color: #a7b1ba; font-family: var(--font-data); }
 
+.board-lower-panels {
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  background: rgba(23,36,49,.68);
+  box-shadow: 8px 10px 0 rgba(4,9,13,.2);
+  backdrop-filter: blur(10px);
+}
+
+.board-lower-panels .panel-section {
+  padding: 21px 23px;
+}
+
+.board-lower-panels .panel-heading {
+  margin-bottom: 14px;
+}
+
+.settings-controls {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(150px, .48fr) minmax(125px, .4fr);
+  align-items: end;
+  gap: 12px;
+}
+
+.settings-controls.spectator-controls {
+  grid-template-columns: minmax(0, 1fr) minmax(150px, auto);
+}
+
+.settings-field { min-width: 0; }
+.settings-field label { margin-bottom: 7px; }
+.settings-controls .restart-button,
+.settings-controls .leave-button { margin-top: 0; }
+.settings-controls .spectator-note { align-self: center; margin: 0; }
+
+.board-activity-section .activity-list {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 30px;
+  row-gap: 14px;
+}
+
+.board-activity-section .empty-activity { grid-column: 1 / -1; }
+
 .side-panel {
   align-self: start;
   margin-top: 100px;
@@ -1553,14 +1604,9 @@ a:focus-visible {
   .lobby-console { width: min(620px, 100%); }
   .site-footer { margin-top: 20px; }
   .game-layout { grid-template-columns: 1fr; }
-  .side-panel { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; }
-  .chat-section { grid-column: 1 / -1; }
+  .side-panel { margin-top: 12px; display: grid; grid-template-columns: 1fr; }
+  .chat-section { grid-column: auto; }
   .chat-list { height: 220px; }
-  .settings-section { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
-  .settings-section .panel-heading, .settings-section label { grid-column: 1 / -1; margin: 0; }
-  .settings-section .spectator-note { grid-column: 1 / -1; }
-  .settings-section select { grid-column: 1 / -1; }
-  .restart-button, .leave-button { margin: 0; }
   .mobile-mode { display: flex; }
 }
 
@@ -1582,6 +1628,7 @@ a:focus-visible {
   .difficulty-option span { font-size: 7px; letter-spacing: -.03em; }
   .join-row { grid-template-columns: 1fr; }
   .join-actions { min-height: 48px; }
+  .spectate-hint { text-align: left; }
   .site-footer { align-items: flex-start; flex-direction: column; padding: 18px 0; }
   .game-topbar { grid-template-columns: 1fr auto; height: auto; min-height: 70px; padding: 12px 0; }
   .room-identity { grid-row: 2; grid-column: 1 / -1; justify-content: center; }
@@ -1604,10 +1651,15 @@ a:focus-visible {
   .revival-countdown strong { font-size: 58px; }
   .revival-ad-space { min-height: 72px; padding-block: 8px; }
   .board-help { display: none; }
+  .board-lower-panels { margin-top: 15px; box-shadow: 5px 7px 0 rgba(4,9,13,.2); }
+  .board-lower-panels .panel-section { padding: 18px 15px; }
+  .settings-controls,
+  .settings-controls.spectator-controls { grid-template-columns: 1fr; }
+  .board-activity-section .activity-list { grid-template-columns: 1fr; }
+  .board-activity-section .empty-activity { grid-column: auto; }
   .side-panel { grid-template-columns: 1fr; }
   .chat-section { grid-column: auto; }
   .chat-list { height: min(38vh, 260px); }
-  .settings-section { grid-column: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {

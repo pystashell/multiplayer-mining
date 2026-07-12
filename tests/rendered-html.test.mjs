@@ -55,6 +55,8 @@ test("ships a read-only spectator entry and shared room chat", async () => {
   ]);
 
   assert.match(app, /enterRoom\("spectate"\)/);
+  assert.match(app, /作为旁观者加入/);
+  assert.match(app, /旁观不占玩家席位/);
   assert.match(app, /JSON\.stringify\(\{ op: "chat", (?:message|content: message) \}\)/);
   assert.match(app, /maxLength=\{240\}/);
   assert.match(app, /session\.role === "spectator"/);
@@ -63,6 +65,30 @@ test("ships a read-only spectator entry and shared room chat", async () => {
   assert.match(app, /room\.chat/);
   assert.match(css, /\.spectator-list/);
   assert.match(css, /\.chat-list/);
+});
+
+test("places settings and accident history below the minefield instead of in the side panel", async () => {
+  const [app, css] = await Promise.all([
+    readFile(new URL("../app/MinefieldApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  const boardStart = app.indexOf('<div className="board-column">');
+  const lowerPanels = app.indexOf('<div className="board-lower-panels">', boardStart);
+  const settings = app.indexOf('board-settings-section', lowerPanels);
+  const activity = app.indexOf('board-activity-section', settings);
+  const boardEnd = app.indexOf('</div>\n\n        <aside className="side-panel">', activity);
+  const sideStart = app.indexOf('<aside className="side-panel">', boardEnd);
+  const sideEnd = app.indexOf('</aside>', sideStart);
+
+  assert.ok(boardStart >= 0 && lowerPanels > boardStart);
+  assert.ok(settings > lowerPanels && activity > settings && boardEnd > activity);
+  assert.ok(sideStart > boardEnd && sideEnd > sideStart);
+  const sidePanelSource = app.slice(sideStart, sideEnd);
+  assert.doesNotMatch(sidePanelSource, /settings-section|activity-section|本局设置|事故记录/);
+  assert.match(css, /\.board-lower-panels/);
+  assert.match(css, /\.settings-controls/);
+  assert.match(css, /\.board-activity-section \.activity-list/);
 });
 
 test("enforces spectator and chat constraints in the API and D1 schema", async () => {

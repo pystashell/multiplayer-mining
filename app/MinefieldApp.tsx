@@ -657,9 +657,10 @@ export function MinefieldApp() {
               <input id="room-code" className="text-input code-input" value={joinCode} maxLength={6} onChange={(event) => setJoinCode(event.target.value.replace(/[^a-z0-9]/gi, "").toUpperCase())} placeholder="房间码" autoCapitalize="characters" />
               <div className="join-actions">
                 <button className="secondary-button" disabled={loading} type="submit">加入游戏</button>
-                <button className="spectate-button" disabled={loading} type="button" onClick={() => void enterRoom("spectate")}>旁观</button>
+                <button className="spectate-button" disabled={loading} type="button" onClick={() => void enterRoom("spectate")}>作为旁观者加入</button>
               </div>
             </form>
+            <p className="spectate-hint">旁观不占玩家席位 · 可以看棋盘和参与聊天</p>
             {error && <p className="form-error" role="alert">{error}</p>}
           </div>
         </section>
@@ -822,6 +823,43 @@ export function MinefieldApp() {
           <div className="board-help">
             {isSpectator ? <span><b>旁观模式</b> 棋盘实时同步但不可操作，欢迎在聊天区指挥。</span> : <><span><b>左键</b> 揭开</span><span><b>右键</b> 旗帜 / 问号</span><span><b>左右键齐按 / 双击数字</b> 多开周围</span><span><b>空格</b> 标记</span></>}
           </div>
+
+          <div className="board-lower-panels">
+            <section className="panel-section settings-section board-settings-section">
+              <div className="panel-heading"><span>{isSpectator ? "旁观状态" : "本局设置"}</span>{isSpectator && <small>READ ONLY</small>}</div>
+              <div className={`settings-controls${isSpectator ? " spectator-controls" : ""}`}>
+                {isSpectator ? (
+                  <p className="spectator-note">你正在以 <strong>{spectatorMe?.name ?? session.playerName}</strong> 的身份旁观。棋盘操作与本局设置已锁定，聊天仍可使用。</p>
+                ) : (
+                  <>
+                    <div className="settings-field">
+                      <label htmlFor="game-difficulty">难度</label>
+                      <select id="game-difficulty" value={currentDifficulty} disabled={isRevivalLocked} onChange={(event) => commitAction({ type: "changeDifficulty", difficulty: event.target.value as Difficulty })}>
+                        {(Object.keys(DIFFICULTIES) as Difficulty[]).map((key) => <option value={key} key={key}>{DIFFICULTIES[key].label} · {DIFFICULTIES[key].meta}</option>)}
+                      </select>
+                    </div>
+                    <button className="restart-button" disabled={isRevivalLocked} onClick={() => commitAction({ type: "restart" })}>重新布置雷区</button>
+                  </>
+                )}
+                <button className="leave-button" onClick={leaveRoom}>{isSpectator ? "离开旁观席" : "暂时离开房间"}</button>
+              </div>
+            </section>
+
+            <section className="panel-section activity-section board-activity-section">
+              <div className="panel-heading"><span>事故记录</span><small>LIVE</small></div>
+              <div className="activity-list">
+                {room.activity.length ? room.activity.slice(0, 7).map((item) => {
+                  const actorSlot = room.players.find((player) => player.id === item.playerId)?.slot;
+                  return (
+                    <div className="activity-item" key={item.id}>
+                      <i className={actorSlot ? `p${actorSlot}` : undefined} aria-hidden="true" />
+                      <p><strong>{item.playerName}</strong>{activityCopy(item)}<time>{new Date(item.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time></p>
+                    </div>
+                  );
+                }) : <p className="empty-activity">还没有事故。很快就会有的。</p>}
+              </div>
+            </section>
+          </div>
         </div>
 
         <aside className="side-panel">
@@ -893,36 +931,6 @@ export function MinefieldApp() {
             </form>
           </section>
 
-          <section className="panel-section activity-section">
-            <div className="panel-heading"><span>事故记录</span><small>LIVE</small></div>
-            <div className="activity-list">
-              {room.activity.length ? room.activity.slice(0, 7).map((item) => {
-                const actorSlot = room.players.find((player) => player.id === item.playerId)?.slot;
-                return (
-                  <div className="activity-item" key={item.id}>
-                    <i className={actorSlot ? `p${actorSlot}` : undefined} aria-hidden="true" />
-                    <p><strong>{item.playerName}</strong>{activityCopy(item)}<time>{new Date(item.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time></p>
-                  </div>
-                );
-              }) : <p className="empty-activity">还没有事故。很快就会有的。</p>}
-            </div>
-          </section>
-
-          <section className="panel-section settings-section">
-            <div className="panel-heading"><span>{isSpectator ? "旁观状态" : "本局设置"}</span>{isSpectator && <small>READ ONLY</small>}</div>
-            {isSpectator ? (
-              <p className="spectator-note">你正在以 <strong>{spectatorMe?.name ?? session.playerName}</strong> 的身份旁观。棋盘操作与本局设置已锁定，聊天仍可使用。</p>
-            ) : (
-              <>
-                <label htmlFor="game-difficulty">难度</label>
-                <select id="game-difficulty" value={currentDifficulty} disabled={isRevivalLocked} onChange={(event) => commitAction({ type: "changeDifficulty", difficulty: event.target.value as Difficulty })}>
-                  {(Object.keys(DIFFICULTIES) as Difficulty[]).map((key) => <option value={key} key={key}>{DIFFICULTIES[key].label} · {DIFFICULTIES[key].meta}</option>)}
-                </select>
-                <button className="restart-button" disabled={isRevivalLocked} onClick={() => commitAction({ type: "restart" })}>重新布置雷区</button>
-              </>
-            )}
-            <button className="leave-button" onClick={leaveRoom}>{isSpectator ? "离开旁观席" : "暂时离开房间"}</button>
-          </section>
         </aside>
       </section>
 
