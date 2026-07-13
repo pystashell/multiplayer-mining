@@ -2,6 +2,10 @@
 
 多人协作扫雷，使用 React、vinext、Cloudflare Workers、Durable Objects 和 Hibernating WebSockets。
 
+## 在线体验
+
+[点击进入多人扫雷](https://multiplayer-mining.pystashell.workers.dev/)
+
 ## 架构
 
 - 一个房间对应一个 `MineRoom` Durable Object。
