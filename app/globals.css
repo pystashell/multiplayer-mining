@@ -156,6 +156,54 @@ a:focus-visible {
   box-shadow: 0 0 12px rgba(189, 231, 91, 0.8);
 }
 
+.topbar-actions,
+.game-topbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 18px;
+}
+
+.game-topbar-actions {
+  justify-self: end;
+}
+
+.locale-switch {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 3px 7px;
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: 999px;
+  background: rgba(255,255,255,.035);
+  color: #6f7c88;
+  font-family: var(--font-data);
+  font-size: 10px;
+  letter-spacing: .06em;
+}
+
+.locale-switch button {
+  min-width: 27px;
+  min-height: 24px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #8e9aa5;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.locale-switch button:hover { color: var(--paper); }
+.locale-switch button.active { background: var(--signal); color: var(--ink); }
+.locale-switch button:focus-visible { outline-width: 2px; outline-offset: 2px; }
+
+html[lang="en"] .brand { letter-spacing: -.025em; }
+
 .lobby-grid {
   min-height: calc(100vh - 146px);
   display: grid;
@@ -581,7 +629,6 @@ a:focus-visible {
 }
 
 .room-identity button:hover { background: rgba(255,255,255,.1); }
-.connection-state { justify-self: end; }
 .connection-state:not(.online) i { background: var(--danger); box-shadow: 0 0 12px rgba(255,96,73,.6); }
 
 .game-layout {
@@ -1636,7 +1683,12 @@ a:focus-visible {
   .site-shell { padding-inline: 16px; }
   .topbar { height: 70px; }
   .topbar-note { font-size: 9px; }
+  .topbar-actions,
+  .game-topbar-actions { gap: 8px; }
+  .lobby-shell .topbar-note { display: none; }
+  .locale-switch { min-height: 30px; padding-inline: 5px; }
   .brand { font-size: 16px; }
+  html[lang="en"] .brand { max-width: 190px; font-size: 13px; line-height: 1.05; }
   .brand-mark { width: 30px; height: 30px; font-size: 21px; }
   .lobby-grid { min-height: auto; gap: 42px; padding: 42px 0 50px; }
   .hero-copy h1 { font-size: clamp(48px, 15vw, 68px); }
@@ -1654,7 +1706,8 @@ a:focus-visible {
   .site-footer { align-items: flex-start; flex-direction: column; padding: 18px 0; }
   .game-topbar { grid-template-columns: 1fr auto; height: auto; min-height: 70px; padding: 12px 0; }
   .room-identity { grid-row: 2; grid-column: 1 / -1; justify-content: center; }
-  .connection-state { grid-column: 2; }
+  .game-topbar-actions { grid-column: 2; }
+  .game-topbar-actions .connection-state { display: none; }
   .game-layout { padding-top: 22px; }
   .game-status-line { min-height: 0; display: block; }
   .friendship-meter { width: 180px; margin-top: 18px; }

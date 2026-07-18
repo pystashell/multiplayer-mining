@@ -355,8 +355,7 @@ function activityForAction(before: GameState, after: GameState, wire: BoardWireA
     return { type: "unmark", detail };
   }
   if (wire.type === "changeDifficulty") {
-    const labels: Record<Difficulty, string> = { beginner: "初级", intermediate: "中级", expert: "专家" };
-    return { type: "difficulty", detail: labels[wire.difficulty] };
+    return { type: "difficulty", detail: wire.difficulty };
   }
   return { type: wire.type, detail };
 }
@@ -722,7 +721,7 @@ export class MineRoomEngine {
       if (action.type === "watchAd") {
         if (incident.phase === "ad") return this.result(false, now);
         this.state.incident = { ...incident, phase: "ad", adEndsAt: now + REVIVAL_AD_MS };
-        this.pushActivity(member, "ad", "所有参赛玩家观看 10 秒广告", now);
+        this.pushActivity(member, "ad", undefined, now);
         this.commit(now);
         return this.result(true, now);
       }
@@ -742,7 +741,7 @@ export class MineRoomEngine {
         }
         this.state.game = after;
         this.state.incident = null;
-        this.pushActivity(member, "end", `${incident.triggeredByName} 踩雷，选择结束游戏`, now);
+        this.pushActivity(member, "end", undefined, now);
         this.commit(now);
         return this.result(true, now);
       }
@@ -775,7 +774,7 @@ export class MineRoomEngine {
         adEndsAt: null,
       };
       // Deliberately do not assign `after`: it contains the private lost board.
-      this.pushActivity(member, "incident", "踩雷了，等待场上玩家选择", now);
+      this.pushActivity(member, "incident", undefined, now);
       this.commit(now);
       return this.result(true, now);
     }
@@ -806,7 +805,7 @@ export class MineRoomEngine {
       this.pushActivity(
         { playerId: incident.triggeredById, name: incident.triggeredByName },
         "revive",
-        "广告结束，棋盘已恢复",
+        undefined,
         now,
       );
       this.commit(now);

@@ -120,7 +120,11 @@ async function callRoom(stub: DurableObjectStub, request: Request) {
     return {
       ok: false as const,
       response: jsonResponse(
-        { error: typeof payload?.error === "string" ? payload.error : "房间服务暂时不可用。" },
+        {
+          error: typeof payload?.error === "string" ? payload.error : "房间服务暂时不可用。",
+          ...(typeof payload?.code === "string" ? { code: payload.code } : {}),
+          ...(typeof payload?.retryable === "boolean" ? { retryable: payload.retryable } : {}),
+        },
         response.status,
       ),
     };

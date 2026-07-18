@@ -251,10 +251,16 @@ async function readMembershipResponse(
 ): Promise<{ session: RoomSession; room: PublicRoom | null; roomCode: string }> {
   const payload: unknown = await response.json().catch(() => null);
   if (!response.ok) {
+    const code = isRecord(payload) && typeof payload.code === "string" && payload.code
+      ? payload.code
+      : `HTTP_${response.status}`;
+    const retryable = isRecord(payload) && typeof payload.retryable === "boolean"
+      ? payload.retryable
+      : response.status >= 500;
     throw new MineRoomSocketError(
-      `HTTP_${response.status}`,
+      code,
       responseError(payload, fallbackError),
-      response.status >= 500,
+      retryable,
     );
   }
   if (!isRecord(payload)) {

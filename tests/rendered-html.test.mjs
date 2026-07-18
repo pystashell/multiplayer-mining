@@ -2,16 +2,26 @@ import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
-test("ships the cooperative Minesweeper product instead of the starter preview", async () => {
-  const [layout, app, css, packageJson] = await Promise.all([
+test("ships the bilingual cooperative Minesweeper product instead of the starter preview", async () => {
+  const [layout, page, app, i18n, css, packageJson] = await Promise.all([
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/MinefieldApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/i18n.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
 
-  assert.match(layout, /同雷共苦｜四人在线扫雷/);
-  assert.match(layout, /最多四个人，一块雷区/);
+  assert.match(i18n, /同雷共苦｜四人在线扫雷/);
+  assert.match(i18n, /Mine Together, Blame Together \| Multiplayer Minesweeper/);
+  assert.match(i18n, /最多四个人，一块雷区/);
+  assert.match(i18n, /Up to four players, one minefield/);
+  assert.match(layout, /cookieStore\.get\(LOCALE_COOKIE\)/);
+  assert.match(layout, /accept-language/);
+  assert.match(layout, /<html lang=\{locale\}>/);
+  assert.match(page, /initialLocale=\{initialLocale\}/);
+  assert.match(app, /<LanguageSwitch locale=\{locale\}/);
+  assert.match(app, /LOCALE_STORAGE_KEY/);
   assert.match(app, /创建房间/);
   assert.match(app, /加入朋友/);
   assert.match(app, /作为旁观者加入/);
@@ -22,8 +32,9 @@ test("ships the cooperative Minesweeper product instead of the starter preview",
   assert.match(css, /\.mine-board/);
   assert.match(css, /\.spectator-list/);
   assert.match(css, /\.chat-list/);
+  assert.match(css, /\.locale-switch/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
-  assert.doesNotMatch(layout + app, /codex-preview|Your site is taking shape/i);
+  assert.doesNotMatch(layout + page + app, /codex-preview|Your site is taking shape/i);
   await assert.rejects(access(new URL("../app/_sites-preview/SkeletonPreview.tsx", import.meta.url)));
 });
 
