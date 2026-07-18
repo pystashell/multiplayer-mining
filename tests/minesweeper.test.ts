@@ -1,6 +1,52 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chordCell, createGame, revealCell, setMark, toggleFlag } from "../lib/minesweeper.ts";
+import {
+  chordCell,
+  createGame,
+  getAdjacentCells,
+  revealCell,
+  setMark,
+  toggleFlag,
+} from "../lib/minesweeper.ts";
+
+test("preset difficulties guarantee a zero-valued first click that opens a region", () => {
+  for (const difficulty of ["beginner", "intermediate", "expert"] as const) {
+    const blank = createGame(difficulty);
+    const x = Math.floor(blank.width / 2);
+    const y = Math.floor(blank.height / 2);
+    const opened = revealCell(blank, x, y, {
+      random: () => 0,
+      now: () => 1000,
+      actorId: "p1",
+    });
+    const target = opened.cells[y * opened.width + x];
+
+    assert.equal(target.isMine, false, `${difficulty}: first cell must be safe`);
+    assert.equal(target.adjacentMines, 0, `${difficulty}: first cell must be zero`);
+    assert.equal(target.isRevealed, true, `${difficulty}: first cell must be revealed`);
+    for (const neighbor of getAdjacentCells(opened, x, y)) {
+      assert.equal(neighbor.isMine, false, `${difficulty}: first-cell neighbors must be safe`);
+      assert.equal(neighbor.isRevealed, true, `${difficulty}: safe region must flood open`);
+    }
+    assert.ok(opened.revealedSafeCells >= 9, `${difficulty}: first click must open a region`);
+  }
+});
+
+test("an extremely dense custom board falls back to first-cell-only safety", () => {
+  const blank = createGame({ width: 4, height: 4, mineCount: 8 });
+  const opened = revealCell(blank, 1, 1, {
+    random: () => 0,
+    now: () => 1000,
+    actorId: "p1",
+  });
+  const target = opened.cells[5];
+
+  assert.equal(target.isMine, false);
+  assert.equal(target.isRevealed, true);
+  assert.ok(target.adjacentMines > 0);
+  assert.equal(opened.cells.filter((cell) => cell.isMine).length, 8);
+  assert.equal(opened.status, "playing");
+});
 
 test("flags are hard protection and classic question marks remain revealable", () => {
   const blank = createGame("beginner");

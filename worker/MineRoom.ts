@@ -487,7 +487,13 @@ export class MineRoom {
   private applyCommand(playerId: string, command: RoomCommand) {
     if (!this.engine) throw new MineRoomEngineError("没有找到这个房间。", 404, "ROOM_NOT_FOUND");
     if (command.op === "action") return this.engine.handleAction({ playerId, action: command.action });
-    if (command.op === "chat") return this.engine.postChat({ playerId, content: command.content });
+    if (command.op === "chat") {
+      return this.engine.postChat({
+        playerId,
+        content: command.content,
+        stickerId: command.stickerId,
+      });
+    }
     if (command.op === "switchRole") return this.engine.switchRole({ playerId, targetRole: command.targetRole });
     if (command.op === "leaveMembership") return this.engine.leave({ playerId });
     throw new MineRoomEngineError("无法识别这个命令。", 400, "BAD_REQUEST");

@@ -62,10 +62,46 @@ test("serializes membership, role switches, spectators, and chat", () => {
   assert.equal(chat.room.chat.at(-1)?.content, "一起围观");
   assert.equal(chat.room.chat.at(-1)?.senderRole, "spectator");
 
+  const sticker = engine.postChat({
+    playerId: "viewer",
+    content: "客户端不能伪造表情内容",
+    stickerId: "boom",
+    now: 6_001,
+  });
+  assert.equal(sticker.room.chat.at(-1)?.content, "💥");
+  assert.equal(sticker.room.chat.at(-1)?.stickerId, "boom");
+  assert.equal(sticker.room.chat.at(-1)?.senderRole, "spectator");
+
   const restored = MineRoomEngine.restore(engine.serialize());
-  assert.equal(restored.snapshot(6_001).players.length, 1);
-  assert.equal(restored.snapshot(6_001).spectators.length, 2);
-  assert.equal(restored.snapshot(6_001).chat.length, 1);
+  assert.equal(restored.snapshot(6_002).players.length, 1);
+  assert.equal(restored.snapshot(6_002).spectators.length, 2);
+  assert.equal(restored.snapshot(6_002).chat.length, 2);
+  assert.equal(restored.snapshot(6_002).chat.at(-1)?.stickerId, "boom");
+});
+
+test("keeps legacy text chat compatible and rejects unknown sticker ids", () => {
+  const engine = createEngine();
+  engine.postChat({ playerId: "host", content: "旧消息", now: 2_000 });
+  const serialized = engine.serialize();
+  delete serialized.chat[0]?.stickerId;
+
+  const restored = MineRoomEngine.restore(serialized);
+  assert.equal(restored.snapshot(2_001).chat[0]?.content, "旧消息");
+  assert.equal(restored.snapshot(2_001).chat[0]?.stickerId, undefined);
+
+  assert.throws(
+    () => restored.postChat({
+      playerId: "host",
+      content: "🤨",
+      stickerId: "not-a-sticker",
+      now: 2_002,
+    }),
+    (error: unknown) => (
+      error instanceof MineRoomEngineError
+      && error.status === 400
+      && error.code === "BAD_REQUEST"
+    ),
+  );
 });
 
 test("persists command receipts and rejects stale or duplicate envelopes", () => {
@@ -133,7 +169,16 @@ test("only endGame commits and publishes the losing board", () => {
 test("enforces the per-member chat window", () => {
   const engine = createEngine();
   for (let index = 0; index < CHAT_RATE_LIMIT; index += 1) {
-    engine.postChat({ playerId: "host", content: `消息 ${index}`, now: 2_000 + index });
+    if (index % 2 === 0) {
+      engine.postChat({ playerId: "host", content: `消息 ${index}`, now: 2_000 + index });
+    } else {
+      engine.postChat({
+        playerId: "host",
+        content: "客户端回退会被覆盖",
+        stickerId: "flag",
+        now: 2_000 + index,
+      });
+    }
   }
   assert.throws(
     () => engine.postChat({ playerId: "host", content: "太快了", now: 2_100 }),

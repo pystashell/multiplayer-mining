@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   MINE_PROTOCOL_VERSION,
+  STICKER_FALLBACKS,
   createMessageId,
   isRoomCode,
   isRoomSession,
@@ -23,6 +24,7 @@ import {
   type RoomSessionIdentity,
   type RoomSnapshot,
   type ServerMessage,
+  type StickerId,
   type WireAction,
 } from "../shared/mine-protocol";
 
@@ -884,6 +886,15 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
     [sendCommand],
   );
 
+  const sendSticker = useCallback(
+    (stickerId: StickerId) => sendCommand({
+      op: "chat",
+      content: STICKER_FALLBACKS[stickerId],
+      stickerId,
+    }),
+    [sendCommand],
+  );
+
   const switchRole = useCallback(
     (targetRole: RoomRole) => sendCommand({ op: "switchRole", targetRole }),
     [sendCommand],
@@ -940,6 +951,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
     sendCommand,
     sendAction,
     sendChat,
+    sendSticker,
     switchRole,
     leaveMembership,
     sync,

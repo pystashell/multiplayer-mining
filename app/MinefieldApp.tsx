@@ -11,15 +11,19 @@ import {
   translateServerMessage,
   type Locale,
 } from "./i18n";
-import type {
-  Activity,
-  Difficulty,
-  GameAction,
-  PublicCell,
-  PublicGame,
-  Room,
-  RoomPlayer,
-  Session,
+import {
+  isStickerId,
+  STICKER_FALLBACKS,
+  STICKER_IDS,
+  type Activity,
+  type Difficulty,
+  type GameAction,
+  type PublicCell,
+  type PublicGame,
+  type Room,
+  type RoomPlayer,
+  type Session,
+  type StickerId,
 } from "../shared/mine-protocol";
 
 const DIFFICULTY_SPECS: Record<Difficulty, { label: "初级" | "中级" | "专家"; size: string; mines: number }> = {
@@ -29,6 +33,17 @@ const DIFFICULTY_SPECS: Record<Difficulty, { label: "初级" | "中级" | "专�
 };
 
 const SESSION_KEY = "shared-minefield-session-v1";
+
+const STICKER_COPY: Record<StickerId, { "zh-CN": string; en: string }> = {
+  safe: { "zh-CN": "我看这格很安全", en: "Looks safe to me" },
+  boom: { "zh-CN": "友情爆破", en: "Friendship exploded" },
+  flag: { "zh-CN": "先插旗再说", en: "Flag first, think later" },
+  pressure: { "zh-CN": "血压上来了", en: "Blood pressure rising" },
+  blame: { "zh-CN": "就是他点的", en: "They clicked it" },
+  friendship: { "zh-CN": "友谊尚存", en: "Friendship survives" },
+  ad: { "zh-CN": "广告位招租", en: "Ad space available" },
+  sweeper: { "zh-CN": "专业扫雷员", en: "Certified sweeper" },
+};
 
 function difficultyCopy(locale: Locale, difficulty: Difficulty) {
   const spec = DIFFICULTY_SPECS[difficulty];
@@ -165,6 +180,7 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
   const [tapMode, setTapMode] = useState<"reveal" | "mark">("reveal");
   const [chatDraft, setChatDraft] = useState("");
   const [sendingChat, setSendingChat] = useState(false);
+  const [stickerPickerOpen, setStickerPickerOpen] = useState(false);
   const [membershipAction, setMembershipAction] = useState<"player" | "spectator" | "leave" | null>(null);
   const [revivalDecision, setRevivalDecision] = useState<"watchAd" | "endGame" | null>(null);
   const [chordPreviewIndex, setChordPreviewIndex] = useState<number | null>(null);
@@ -335,6 +351,7 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
     setPausedSession(null);
     setChatDraft("");
     setSendingChat(false);
+    setStickerPickerOpen(false);
     setMembershipAction(null);
     setRevivalDecision(null);
     setSession(next);
@@ -380,6 +397,7 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
       setJoinCode("");
       setChatDraft("");
       setSendingChat(false);
+      setStickerPickerOpen(false);
       setMembershipAction(null);
       setRevivalDecision(null);
       setNotice("");
@@ -460,6 +478,7 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
     setJoinCode("");
     setChatDraft("");
     setSendingChat(false);
+    setStickerPickerOpen(false);
     setRevivalDecision(null);
     setError("");
   };
@@ -513,6 +532,24 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
       await roomSocket.sendChat(message);
       if (generation !== uiGenerationRef.current || sessionRef.current?.token !== activeSession.token) return;
       setChatDraft("");
+      setError("");
+    } catch (chatError) {
+      if (generation !== uiGenerationRef.current || sessionRef.current?.token !== activeSession.token) return;
+      setError(displayError(chatError, locale));
+    } finally {
+      if (generation === uiGenerationRef.current && sessionRef.current?.token === activeSession.token) setSendingChat(false);
+    }
+  };
+
+  const sendSticker = async (stickerId: StickerId) => {
+    const activeSession = sessionRef.current;
+    if (!activeSession || sendingChat) return;
+    const generation = uiGenerationRef.current;
+    setSendingChat(true);
+    try {
+      await roomSocket.sendSticker(stickerId);
+      if (generation !== uiGenerationRef.current || sessionRef.current?.token !== activeSession.token) return;
+      setStickerPickerOpen(false);
       setError("");
     } catch (chatError) {
       if (generation !== uiGenerationRef.current || sessionRef.current?.token !== activeSession.token) return;
@@ -946,6 +983,7 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
               {room.chat?.length ? room.chat.map((message) => {
                 const slotClass = message.senderRole === "player" && message.senderSlot ? ` chat-player-${message.senderSlot}` : " chat-spectator";
                 const isMine = message.senderId === session.playerId;
+                const stickerId = isStickerId(message.stickerId) ? message.stickerId : null;
                 return (
                   <article className={`chat-message${slotClass}${isMine ? " mine" : ""}`} key={message.id}>
                     <div className="chat-message-meta">
@@ -953,7 +991,12 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
                       <span>{message.senderRole === "spectator" ? t("旁观") : locale === "zh-CN" ? `${message.senderSlot ?? "?"} 号玩家` : `Player ${message.senderSlot ?? "?"}`}</span>
                       <time>{new Date(message.createdAt).toLocaleTimeString(locale === "zh-CN" ? "zh-CN" : "en-US", { hour: "2-digit", minute: "2-digit" })}</time>
                     </div>
-                    <p>{message.content}</p>
+                    {stickerId ? (
+                      <div className="chat-sticker" role="img" aria-label={`${STICKER_COPY[stickerId][locale]} ${message.content}`}>
+                        <span aria-hidden="true">{STICKER_FALLBACKS[stickerId]}</span>
+                        <small>{STICKER_COPY[stickerId][locale]}</small>
+                      </div>
+                    ) : <p>{message.content}</p>}
                   </article>
                 );
               }) : <div className="empty-chat"><span aria-hidden="true">…</span><p>{t("还没人开口。先发一句“这格肯定安全”。")}</p></div>}
@@ -975,7 +1018,38 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
                 }}
                 placeholder={isSpectator ? t("给场上选手一点建议…") : t("和队友商量，或提前甩锅…")}
               />
-              <div><small>{chatDraft.length}/240</small><button type="submit" disabled={!connected || !chatDraft.trim() || sendingChat}>{sendingChat ? t("发送中") : t("发送")}</button></div>
+              {stickerPickerOpen && (
+                <div className="sticker-picker" id="chat-sticker-picker" role="group" aria-label={t("选择一个表情包")}>
+                  {STICKER_IDS.map((stickerId) => (
+                    <button
+                      type="button"
+                      className="sticker-option"
+                      disabled={!connected || sendingChat}
+                      aria-label={`${t("发送表情包")}：${STICKER_COPY[stickerId][locale]}`}
+                      onClick={() => void sendSticker(stickerId)}
+                      key={stickerId}
+                    >
+                      <span aria-hidden="true">{STICKER_FALLBACKS[stickerId]}</span>
+                      <small>{STICKER_COPY[stickerId][locale]}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="chat-form-actions">
+                <button
+                  type="button"
+                  className={`sticker-toggle${stickerPickerOpen ? " active" : ""}`}
+                  disabled={!connected || sendingChat}
+                  aria-expanded={stickerPickerOpen}
+                  aria-controls="chat-sticker-picker"
+                  aria-label={stickerPickerOpen ? t("关闭表情包") : t("打开表情包")}
+                  onClick={() => setStickerPickerOpen((open) => !open)}
+                >
+                  <span aria-hidden="true">☺</span>{t("表情包")}
+                </button>
+                <small className="chat-count">{chatDraft.length}/240</small>
+                <button className="chat-send" type="submit" disabled={!connected || !chatDraft.trim() || sendingChat}>{sendingChat ? t("发送中") : t("发送")}</button>
+              </div>
             </form>
           </section>
 

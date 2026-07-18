@@ -127,9 +127,12 @@ test("keeps credentials out of the WebSocket URL and hashes them at rest", async
 });
 
 test("preserves player, spectator, chat, and role constraints in the room engine", async () => {
-  const [app, engine] = await Promise.all([
+  const [app, hook, protocol, engine, css] = await Promise.all([
     readFile(new URL("../app/MinefieldApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/useMineRoomSocket.ts", import.meta.url), "utf8"),
+    readFile(new URL("../shared/mine-protocol.ts", import.meta.url), "utf8"),
     readFile(new URL("../shared/mine-room-engine.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
 
   assert.match(engine, /MAX_PLAYERS = 4/);
@@ -144,6 +147,15 @@ test("preserves player, spectator, chat, and role constraints in the room engine
   assert.match(app, /roomSocket\.switchRole\(targetRole\)/);
   assert.match(app, /roomSocket\.leaveMembership\(\)/);
   assert.match(app, /maxLength=\{240\}/);
+  assert.match(protocol, /\{ op: "chat"; content: string; stickerId\?: StickerId \}/);
+  assert.doesNotMatch(protocol, /\{ op: "sticker"/);
+  assert.match(hook, /const sendSticker/);
+  assert.match(hook, /sendCommand\(\{[\s\S]{0,160}op: "chat",[\s\S]{0,160}stickerId,[\s\S]{0,20}\}\)/);
+  assert.match(app, /roomSocket\.sendSticker\(stickerId\)/);
+  assert.match(app, /className="sticker-picker"/);
+  assert.match(app, /message\.stickerId/);
+  assert.match(css, /\.sticker-picker/);
+  assert.match(css, /\.chat-sticker/);
 });
 
 test("keeps mine incidents private and resolves ads with an alarm-ready deadline", async () => {

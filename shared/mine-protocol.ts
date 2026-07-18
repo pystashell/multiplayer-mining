@@ -5,6 +5,24 @@ export type CellState = "hidden" | "flagged" | "questioned" | "revealed";
 export type GameStatus = "ready" | "playing" | "won" | "lost";
 export type RoomRole = "player" | "spectator";
 export type PlayerSlot = 1 | 2 | 3 | 4;
+export type StickerId = "safe" | "boom" | "flag" | "pressure" | "blame" | "friendship" | "ad" | "sweeper";
+
+export const STICKER_FALLBACKS: Readonly<Record<StickerId, string>> = {
+  safe: "😎",
+  boom: "💥",
+  flag: "🚩",
+  pressure: "🤯",
+  blame: "👉",
+  friendship: "🤝",
+  ad: "📺",
+  sweeper: "🫡",
+};
+
+export const STICKER_IDS = Object.keys(STICKER_FALLBACKS) as StickerId[];
+
+export function isStickerId(value: unknown): value is StickerId {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(STICKER_FALLBACKS, value);
+}
 
 export type PublicCell = {
   index: number;
@@ -52,6 +70,7 @@ export type ChatMessage = {
   senderRole: RoomRole;
   senderSlot: PlayerSlot | null;
   content: string;
+  stickerId?: StickerId;
   createdAt: number;
 };
 
@@ -152,7 +171,7 @@ export type JoinMessage = {
 
 export type RoomCommand =
   | { op: "action"; action: WireAction }
-  | { op: "chat"; content: string }
+  | { op: "chat"; content: string; stickerId?: StickerId }
   | { op: "switchRole"; targetRole: RoomRole }
   | { op: "leaveMembership" }
   | { op: "sync" };

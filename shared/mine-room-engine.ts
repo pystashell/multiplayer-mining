@@ -8,6 +8,8 @@ import {
 } from "../lib/minesweeper.ts";
 import {
   isRoomCode,
+  isStickerId,
+  STICKER_FALLBACKS,
   type ChatMessage,
   type Difficulty,
   type PlayerSlot,
@@ -17,6 +19,7 @@ import {
   type RoomActivity,
   type RoomRevival,
   type RoomRole,
+  type StickerId,
   type WireAction,
 } from "./mine-protocol.ts";
 
@@ -212,6 +215,11 @@ function normalizeChatContent(input: unknown): string {
     throw new MineRoomEngineError("聊天内容最多 240 个字。", 400, "BAD_REQUEST");
   }
   return content;
+}
+
+function normalizeSticker(input: unknown): StickerId {
+  if (isStickerId(input)) return input;
+  throw new MineRoomEngineError("这个表情包不存在。", 400, "BAD_REQUEST");
 }
 
 function normalizeDifficulty(input: unknown): Difficulty {
@@ -667,11 +675,27 @@ export class MineRoomEngine {
     return { ...this.result(true, now), identity: this.identity(member) };
   }
 
-  postChat(input: { playerId: string; content: unknown; now?: number }): EngineMutationResult {
+  postChat(input: { playerId: string; content: unknown; stickerId?: unknown; now?: number }): EngineMutationResult {
+    if (input.stickerId !== undefined) {
+      const stickerId = normalizeSticker(input.stickerId);
+      return this.postMessage({
+        playerId: input.playerId,
+        content: STICKER_FALLBACKS[stickerId],
+        stickerId,
+        now: input.now,
+      });
+    }
+    return this.postMessage({
+      playerId: input.playerId,
+      content: normalizeChatContent(input.content),
+      now: input.now,
+    });
+  }
+
+  private postMessage(input: { playerId: string; content: string; stickerId?: StickerId; now?: number }): EngineMutationResult {
     const now = readNow(input.now);
     this.prepare(now);
     const member = this.requireMember(normalizePlayerId(input.playerId));
-    const content = normalizeChatContent(input.content);
     const current = this.state.chatRates[member.playerId];
     const rate = !current || current.resetAt <= now
       ? { count: 0, resetAt: now + CHAT_RATE_WINDOW_MS }
@@ -687,7 +711,8 @@ export class MineRoomEngine {
       senderName: member.name,
       senderRole: member.role,
       senderSlot: member.slot,
-      content,
+      content: input.content,
+      ...(input.stickerId ? { stickerId: input.stickerId } : {}),
       createdAt: now,
     });
     this.state.chat = this.state.chat.slice(-MAX_CHAT_MESSAGES);

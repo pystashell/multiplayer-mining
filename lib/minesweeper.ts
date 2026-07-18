@@ -241,11 +241,22 @@ function placeMines(
   safeY: number,
   random: RandomSource,
 ): void {
-  const excluded = cellIndex(state, safeX, safeY);
+  const safeIndex = cellIndex(state, safeX, safeY);
+  const preferredSafeIndexes = new Set([
+    safeIndex,
+    ...adjacentIndexes(state, safeX, safeY),
+  ]);
+  // Prefer a zero-valued first cell so the existing flood fill opens a useful
+  // region. Extremely dense custom boards may not have enough remaining cells
+  // for every mine, so those boards retain the original first-cell-only safety.
+  const excluded =
+    state.mineCount <= cells.length - preferredSafeIndexes.size
+      ? preferredSafeIndexes
+      : new Set([safeIndex]);
   const candidates: number[] = [];
 
   for (let index = 0; index < cells.length; index += 1) {
-    if (index !== excluded) candidates.push(index);
+    if (!excluded.has(index)) candidates.push(index);
   }
 
   // Partial Fisher-Yates shuffle: only the selected prefix is randomized.
@@ -342,7 +353,7 @@ function completeLoss(state: GameState, cells: Cell[], timestamp: number): GameS
   };
 }
 
-/** Reveal one cell, with lazy first-cell-safe mine placement and zero flood fill. */
+/** Reveal one cell, with lazy first-region-safe mine placement and zero flood fill. */
 export function revealCell(
   state: GameState,
   x: number,

@@ -32,5 +32,9 @@ test("translates interface and server errors without leaking Chinese into Englis
     translateServerMessage("en", "RATE_LIMITED", "发得太快了，请 7 秒后再试。"),
     "You're sending messages too quickly. Try again in 7 seconds.",
   );
+  assert.equal(
+    translateServerMessage("en", "BAD_REQUEST", "这个表情包不存在。"),
+    "That sticker does not exist.",
+  );
   assert.doesNotMatch(translateServerMessage("en", "CONFLICT", "未收录的中文错误"), /[\u3400-\u9fff]/);
 });
