@@ -34,6 +34,7 @@ export const RETURNED_CHAT_MESSAGES = 40;
 export const CHAT_RATE_LIMIT = 8;
 export const CHAT_RATE_WINDOW_MS = 30_000;
 export const REVIVAL_AD_MS = 10_000;
+export const RESERVATION_TTL_MS = 60_000;
 
 const SERIALIZED_SCHEMA_VERSION = 1 as const;
 const MAX_RECEIPTS = 256;
@@ -60,6 +61,8 @@ export type PersistedRoomMember = {
   joinedAt: number;
   lastSeenAt: number;
   lastSequence: number;
+  activatedAt: number | null;
+  reservationExpiresAt: number | null;
 };
 
 export type PersistedChatRate = {
@@ -84,6 +87,7 @@ export type CommandReceipt = {
 export type SerializedMineRoomState = {
   schemaVersion: typeof SERIALIZED_SCHEMA_VERSION;
   code: string;
+  roundId: string;
   version: number;
   game: GameState;
   members: PersistedRoomMember[];
@@ -166,6 +170,8 @@ export type MineRoomErrorCode =
   | "ROOM_FULL"
   | "SPECTATOR_FULL"
   | "RATE_LIMITED"
+  | "STALE_ROUND"
+  | "COMMAND_EXPIRED"
   | "CONFLICT";
 
 export class MineRoomEngineError extends Error {
@@ -223,7 +229,7 @@ function normalizeSticker(input: unknown): StickerId {
 }
 
 function normalizeDifficulty(input: unknown): Difficulty {
-  if (typeof input === "string" && input in DIFFICULTY_PRESETS) return input as Difficulty;
+  if (typeof input === "string" && Object.hasOwn(DIFFICULTY_PRESETS, input)) return input as Difficulty;
   throw new MineRoomEngineError("这个难度不存在。", 400, "BAD_REQUEST");
 }
 
@@ -284,7 +290,7 @@ function shiftStartedAtForPause(game: GameState, incident: PersistedRoomIncident
 
 function publicGame(game: GameState): PublicGame {
   const terminal = game.status === "won" || game.status === "lost";
-  const difficulty = game.difficulty in DIFFICULTY_PRESETS ? game.difficulty as Difficulty : "beginner";
+  const difficulty = Object.hasOwn(DIFFICULTY_PRESETS, game.difficulty) ? game.difficulty as Difficulty : "beginner";
   const cells = game.cells.map((cell, index): PublicCell => {
     let state: PublicCell["state"] = "hidden";
     if (cell.isExploded) state = "revealed";
@@ -306,6 +312,7 @@ function publicGame(game: GameState): PublicGame {
   });
 
   return {
+    revision: game.revision,
     difficulty,
     width: game.width,
     height: game.height,
@@ -429,6 +436,7 @@ export class MineRoomEngine {
     const state: SerializedMineRoomState = {
       schemaVersion: SERIALIZED_SCHEMA_VERSION,
       code,
+      roundId: createId(),
       version: 1,
       game: createGame(difficulty),
       members: [{
@@ -440,6 +448,8 @@ export class MineRoomEngine {
         joinedAt: now,
         lastSeenAt: now,
         lastSequence: 0,
+        activatedAt: null,
+        reservationExpiresAt: now + RESERVATION_TTL_MS,
       }],
       chat: [],
       activity: [{
@@ -472,7 +482,14 @@ export class MineRoomEngine {
     state.activity = state.activity.slice(0, MAX_ACTIVITY);
     state.receipts = (state.receipts ?? []).slice(-MAX_RECEIPTS);
     state.chatRates ??= {};
-    for (const member of state.members) member.lastSequence ??= 0;
+    // Existing rooms cannot distinguish old reservations from paused players.
+    // Preserve those memberships; only new reservations receive a deadline.
+    state.roundId ??= `${state.code}:legacy:${state.createdAt}`;
+    for (const member of state.members) {
+      member.lastSequence ??= 0;
+      if (member.activatedAt === undefined) member.activatedAt = member.joinedAt;
+      member.reservationExpiresAt ??= null;
+    }
     return new MineRoomEngine(state, options);
   }
 
@@ -513,6 +530,7 @@ export class MineRoomEngine {
       : null;
     return {
       code: this.state.code,
+      roundId: this.state.roundId,
       version: this.state.version,
       game: publicGame(this.state.game),
       players,
@@ -536,13 +554,15 @@ export class MineRoomEngine {
       if (!constantTimeEqual(existing.tokenHash, tokenHash)) {
         throw new MineRoomEngineError("这个身份已经属于其他连接。", 409, "CONFLICT");
       }
+      if (existing.name !== name || existing.role !== role) {
+        throw new MineRoomEngineError("重试请求与原来的加入请求不一致。", 409, "CONFLICT");
+      }
       return { ...this.result(false, now), identity: this.identity(existing) };
     }
     if (this.state.members.some((member) => constantTimeEqual(member.tokenHash, tokenHash))) {
       throw new MineRoomEngineError("这个房间凭据已经使用。", 409, "CONFLICT");
     }
 
-    this.pruneStaleSpectators(now);
     let slot: PlayerSlot | null = null;
     if (role === "player") {
       slot = this.nextOpenSlot();
@@ -560,6 +580,8 @@ export class MineRoomEngine {
       joinedAt: now,
       lastSeenAt: now,
       lastSequence: 0,
+      activatedAt: null,
+      reservationExpiresAt: now + RESERVATION_TTL_MS,
     };
     this.state.members.push(member);
     if (role === "player") this.pushActivity(member, "join", undefined, now);
@@ -576,6 +598,9 @@ export class MineRoomEngine {
     if (!constantTimeEqual(member.tokenHash, suppliedHash)) {
       throw new MineRoomEngineError("房间身份已失效，请重新加入。", 401, "UNAUTHORIZED");
     }
+    if (member.reservationExpiresAt !== null && now >= member.reservationExpiresAt) {
+      throw new MineRoomEngineError("加入预约已过期，请重新加入。", 401, "UNAUTHORIZED");
+    }
     this.touchMember(member, now);
     return this.identity(member);
   }
@@ -584,6 +609,9 @@ export class MineRoomEngine {
     const identity = await this.authenticate(input);
     const now = readNow(input.now);
     const connectionId = input.connectionId ?? this.createId();
+    const member = this.requireMember(identity.playerId);
+    member.activatedAt ??= now;
+    member.reservationExpiresAt = null;
     this.connections.set(connectionId, identity.playerId);
     return { ...this.result(false, now), identity, connectionId };
   }
@@ -594,7 +622,6 @@ export class MineRoomEngine {
     const playerId = normalizePlayerId(playerIdInput);
     const member = this.requireMember(playerId);
     this.connections.set(connectionId, playerId);
-    this.touchMember(member, now);
     return this.identity(member);
   }
 
@@ -635,11 +662,8 @@ export class MineRoomEngine {
     this.prepare(now);
     const playerId = normalizePlayerId(input.playerId);
     this.requireMember(playerId);
-    this.state.members = this.state.members.filter((member) => member.playerId !== playerId);
-    delete this.state.chatRates[playerId];
-    for (const [connectionId, connectedPlayerId] of this.connections) {
-      if (connectedPlayerId === playerId) this.connections.delete(connectionId);
-    }
+    this.removeMember(playerId);
+    this.settleUnownedIncident(now);
     this.commit(now);
     return { ...this.result(true, now), left: true };
   }
@@ -658,7 +682,6 @@ export class MineRoomEngine {
     }
 
     if (targetRole === "spectator") {
-      this.pruneStaleSpectators(now);
       if (this.spectatorCount() >= MAX_SPECTATORS) {
         throw new MineRoomEngineError("这个房间已经有 20 位旁观者了。", 409, "SPECTATOR_FULL");
       }
@@ -723,6 +746,8 @@ export class MineRoomEngine {
   handleAction(input: {
     playerId: string;
     action: WireAction;
+    roundId?: string;
+    observedGameRevision?: number;
     observedVersion?: number;
     now?: number;
   }): EngineMutationResult {
@@ -732,10 +757,16 @@ export class MineRoomEngine {
     if (member.role !== "player") {
       throw new MineRoomEngineError("旁观者不能操作雷区。", 403, "FORBIDDEN");
     }
-    this.touchMember(member, now);
     const action = input.action;
     if (!action || typeof action !== "object" || typeof action.type !== "string") {
       throw new MineRoomEngineError("无法识别这一步。", 400, "BAD_REQUEST");
+    }
+    if (input.roundId !== undefined && input.roundId !== this.state.roundId) {
+      throw new MineRoomEngineError("这一步属于上一局，已同步当前棋盘。", 409, "STALE_ROUND");
+    }
+    if ((action.type === "restart" || action.type === "changeDifficulty")
+      && input.observedGameRevision !== undefined && input.observedGameRevision !== this.state.game.revision) {
+      throw new MineRoomEngineError("棋盘已经变化，请确认后再重开。", 409, "CONFLICT", true);
     }
     if (action.type === "restart" && input.observedVersion !== undefined && input.observedVersion !== this.state.version) {
       throw new MineRoomEngineError("队友刚好也动了一步，棋盘已刷新，请再点一次。", 409, "CONFLICT", true);
@@ -805,6 +836,7 @@ export class MineRoomEngine {
     }
 
     this.state.game = after;
+    if (action.type === "restart" || action.type === "changeDifficulty") this.state.roundId = this.createId();
     const activity = activityForAction(before, after, action, translated.detail);
     this.pushActivity(member, activity.type, activity.detail, now);
     this.commit(now);
@@ -822,9 +854,22 @@ export class MineRoomEngine {
       this.state.version += 1;
       return { changed: true, expired: true, revision: this.state.version, room: null, nextDueAt: null };
     }
+    let changed = false;
+    for (const member of [...this.state.members]) {
+      if ((member.reservationExpiresAt !== null && now >= member.reservationExpiresAt)
+        || (member.role === "spectator" && !this.isConnected(member.playerId) && now - member.lastSeenAt >= SPECTATOR_STALE_MS)) {
+        this.removeMember(member.playerId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.settleUnownedIncident(now);
+      this.state.version += 1;
+      this.state.updatedAt = now;
+    }
     const incident = this.state.incident;
     if (incident?.phase === "ad" && incident.adEndsAt !== null && now >= incident.adEndsAt) {
-      const pausedGame = shiftStartedAtForPause(this.state.game, incident, now);
+      const pausedGame = shiftStartedAtForPause(this.state.game, incident, incident.adEndsAt);
       this.state.game = { ...pausedGame, revision: pausedGame.revision + 1 };
       this.state.incident = null;
       this.pushActivity(
@@ -843,7 +888,7 @@ export class MineRoomEngine {
       };
     }
     return {
-      changed: false,
+      changed,
       expired: false,
       revision: this.state.version,
       room: this.snapshot(now),
@@ -854,7 +899,13 @@ export class MineRoomEngine {
   nextDueAt(): number | null {
     if (this.state.expiredAt !== null) return null;
     const adEndsAt = this.state.incident?.phase === "ad" ? this.state.incident.adEndsAt : null;
-    return adEndsAt === null ? this.state.expiresAt : Math.min(this.state.expiresAt, adEndsAt);
+    return Math.min(this.state.expiresAt, adEndsAt ?? Infinity,
+      ...this.state.members.map((member) => Math.min(member.reservationExpiresAt ?? Infinity,
+        member.role === "spectator" && !this.isConnected(member.playerId) ? member.lastSeenAt + SPECTATOR_STALE_MS : Infinity)));
+  }
+
+  lastAcceptedSequence(playerId: string): number {
+    return this.requireMember(playerId).lastSequence;
   }
 
   inspectSequence(playerIdInput: string, id: string, sequence: number): SequenceDecision {
@@ -901,8 +952,8 @@ export class MineRoomEngine {
   }
 
   private prepare(now: number): void {
-    const advanced = this.advance(now);
-    if (advanced.expired) throw new MineRoomEngineError("没有找到这个房间，可能已经过期了。", 404, "ROOM_NOT_FOUND");
+    // Time advancement is explicit: the adapter must persist and publish its result.
+    this.assertAvailable(now);
   }
 
   private assertAvailable(now: number): void {
@@ -952,12 +1003,24 @@ export class MineRoomEngine {
     return this.isConnected(member.playerId);
   }
 
-  private pruneStaleSpectators(now: number): void {
-    this.state.members = this.state.members.filter((member) => (
-      member.role !== "spectator"
-      || this.isConnected(member.playerId)
-      || now - member.lastSeenAt < SPECTATOR_STALE_MS
-    ));
+  private removeMember(playerId: string): void {
+    this.state.members = this.state.members.filter((member) => member.playerId !== playerId);
+    delete this.state.chatRates[playerId];
+    this.state.receipts = this.state.receipts.filter((receipt) => receipt.playerId !== playerId);
+    for (const [connectionId, connectedPlayerId] of this.connections) {
+      if (connectedPlayerId === playerId) this.connections.delete(connectionId);
+    }
+  }
+
+  private settleUnownedIncident(now: number): void {
+    const incident = this.state.incident;
+    if (!incident || this.state.members.some((member) => member.role === "player")) return;
+    const before = shiftStartedAtForPause(this.state.game, incident, now);
+    this.state.game = reduceGameAction(before, translateAction(incident.action, before).engine, {
+      actorId: incident.triggeredById, now: () => now,
+      ...(this.random ? { random: this.random } : {}),
+    });
+    this.state.incident = null;
   }
 
   private touchMember(member: PersistedRoomMember, now: number, force = false): void {

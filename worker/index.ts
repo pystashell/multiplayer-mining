@@ -19,19 +19,6 @@ const MAX_BODY_BYTES = 2 * 1024;
 const MAX_ROOM_CODE_ATTEMPTS = 12;
 const VALID_DIFFICULTIES = new Set<Difficulty>(["beginner", "intermediate", "expert"]);
 
-interface Env {
-  ASSETS: Fetcher;
-  MINE_ROOMS: DurableObjectNamespace;
-  ROOM_CREATE_LIMIT: RateLimit;
-  ROOM_JOIN_LIMIT: RateLimit;
-  ROOM_SOCKET_LIMIT: RateLimit;
-}
-
-interface ExecutionContext {
-  waitUntil(promise: Promise<unknown>): void;
-  passThroughOnException(): void;
-}
-
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -89,22 +76,30 @@ async function enforceRateLimit(
 async function readJsonBody(request: Request) {
   const declaredLength = Number(request.headers.get("Content-Length") ?? 0);
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
-    throw new Response(JSON.stringify({ error: "请求内容太长。" }), {
-      status: 413,
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-    });
+    await request.body?.cancel();
+    throw jsonResponse({ error: "请求内容太长。" }, 413);
   }
-
-  const rawBody = await request.text();
-  if (new TextEncoder().encode(rawBody).byteLength > MAX_BODY_BYTES) {
-    throw new Response(JSON.stringify({ error: "请求内容太长。" }), {
-      status: 413,
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-    });
+  const bytes = new Uint8Array(MAX_BODY_BYTES);
+  let length = 0;
+  const reader = request.body?.getReader();
+  if (reader) {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (length + value.byteLength > MAX_BODY_BYTES) {
+          await reader.cancel();
+          throw jsonResponse({ error: "请求内容太长。" }, 413);
+        }
+        bytes.set(value, length);
+        length += value.byteLength;
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
-
   try {
-    return JSON.parse(rawBody) as unknown;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length))) as unknown;
   } catch {
     throw new Response(JSON.stringify({ error: "请求不是有效的 JSON。" }), {
       status: 400,
@@ -188,8 +183,14 @@ async function joinRoom(request: Request, env: Env, roomCode: string) {
   if (!name || !isRoomRole(requestedRole)) return jsonResponse({ error: "名字或房间身份不正确。" }, 400);
 
   const role: RoomRole = requestedRole;
-  const token = createToken();
-  const playerId = crypto.randomUUID();
+  const retryKey = value.idempotencyKey;
+  if (retryKey !== undefined && (typeof retryKey !== "string" || !/^[a-f0-9]{64}$/.test(retryKey))) {
+    return jsonResponse({ error: "加入重试凭据无效。" }, 400);
+  }
+  // The random retry key is itself a secret capability. Domain-separated hashes
+  // reproduce the same reservation without storing a raw token or HTTP response.
+  const token = retryKey ? await hashToken(`join-token:${roomCode}:${retryKey}`) : createToken();
+  const playerId = retryKey ? await hashToken(`join-player:${roomCode}:${retryKey}`) : crypto.randomUUID();
   const tokenHash = await hashToken(token);
   const stub = env.MINE_ROOMS.getByName(roomCode);
   const result = await callRoom(stub, new Request(new URL("/internal/join", request.url), {
@@ -220,7 +221,7 @@ const worker = {
     try {
       if (url.pathname === "/api/rooms/health") {
         if (request.method !== "GET") return new Response(null, { status: 405, headers: { Allow: "GET" } });
-        return env.MINE_ROOMS.getByName("room-health-check").fetch(
+        return await env.MINE_ROOMS.getByName("room-health-check").fetch(
           new Request(new URL("/internal/health", request.url)),
         );
       }
@@ -230,7 +231,7 @@ const worker = {
         if (!hasAllowedOrigin(request)) return jsonResponse({ error: "请求来源不允许。" }, 403);
         const limited = await enforceRateLimit(request, env.ROOM_CREATE_LIMIT, "create");
         if (limited) return limited;
-        return createRoom(request, env);
+        return await createRoom(request, env);
       }
 
       const socketMatch = /^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})\/socket$/.exec(url.pathname);
@@ -243,7 +244,7 @@ const worker = {
         if (!hasAllowedOrigin(request)) return jsonResponse({ error: "请求来源不允许。" }, 403);
         const limited = await enforceRateLimit(request, env.ROOM_SOCKET_LIMIT, "socket");
         if (limited) return limited;
-        return env.MINE_ROOMS.getByName(roomCode).fetch(request);
+        return await env.MINE_ROOMS.getByName(roomCode).fetch(request);
       }
 
       const roomMatch = /^\/api\/rooms\/([A-HJ-NP-Z2-9]{6})$/.exec(url.pathname);
@@ -254,14 +255,14 @@ const worker = {
         if (!hasAllowedOrigin(request)) return jsonResponse({ error: "请求来源不允许。" }, 403);
         const limited = await enforceRateLimit(request, env.ROOM_JOIN_LIMIT, "join");
         if (limited) return limited;
-        return joinRoom(request, env, roomCode);
+        return await joinRoom(request, env, roomCode);
       }
 
       if (url.pathname === "/api/rooms/" || url.pathname.startsWith("/api/rooms/")) {
         return jsonResponse({ error: "房间地址不正确。" }, 404);
       }
 
-      return handler.fetch(request, env, ctx);
+      return await handler.fetch(request, env, ctx);
     } catch (error) {
       if (error instanceof Response) return error;
       console.error("Minefield worker request failed", error);

@@ -32,8 +32,6 @@ const DIFFICULTY_SPECS: Record<Difficulty, { label: "初级" | "中级" | "专�
   expert: { label: "专家", size: "30×16", mines: 99 },
 };
 
-const SESSION_KEY = "shared-minefield-session-v1";
-
 const STICKER_COPY: Record<StickerId, { "zh-CN": string; en: string }> = {
   safe: { "zh-CN": "我看这格很安全", en: "Looks safe to me" },
   boom: { "zh-CN": "友情爆破", en: "Friendship exploded" },
@@ -167,16 +165,17 @@ function CellGlyph({ cell }: { cell: PublicCell }) {
 export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
   const [locale, setLocale] = useState<Locale>(initialLocale);
   const roomSocket = useMineRoomSocket({ autoResume: true });
+  const { getServerNow } = roomSocket;
   const [name, setName] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [difficulty, setDifficulty] = useState<Difficulty>("intermediate");
-  const [session, setSession] = useState<Session | null>(null);
-  const [pausedSession, setPausedSession] = useState<Session | null>(null);
-  const [room, setRoom] = useState<Room | null>(null);
+  const pausedSession = roomSocket.status === "disconnected" ? roomSocket.session : null;
+  const session = pausedSession ? null : roomSocket.session;
+  const room = session && roomSocket.room?.code === session.code ? roomSocket.room : null;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [connected, setConnected] = useState(false);
+  const connected = roomSocket.connected;
   const [tapMode, setTapMode] = useState<"reveal" | "mark">("reveal");
   const [chatDraft, setChatDraft] = useState("");
   const [sendingChat, setSendingChat] = useState(false);
@@ -242,44 +241,14 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
     sessionRef.current = session;
   }, [session]);
 
-  const acceptRoom = useCallback((next: Room) => {
-    const activeSession = sessionRef.current;
-    if (!activeSession || activeSession.code !== next.code) return;
-    setRoom((current) => (
-      !current || current.code !== next.code || next.version >= current.version ? next : current
-    ));
-  }, []);
-
   useEffect(() => {
     const nextSession = roomSocket.session;
+    if (!nextSession) return;
     const timer = window.setTimeout(() => {
-      if (!nextSession) {
-        if (sessionRef.current || roomRef.current) uiGenerationRef.current += 1;
-        sessionRef.current = null;
-        roomRef.current = null;
-        setSession(null);
-        setPausedSession(null);
-        setRoom(null);
-        return;
-      }
-      window.localStorage.setItem(SESSION_KEY, JSON.stringify(nextSession));
-      sessionRef.current = nextSession;
-      setSession(nextSession);
       setName(nextSession.playerName || "");
     }, 0);
     return () => window.clearTimeout(timer);
   }, [roomSocket.session]);
-
-  useEffect(() => {
-    if (!roomSocket.room) return;
-    const timer = window.setTimeout(() => acceptRoom(roomSocket.room!), 0);
-    return () => window.clearTimeout(timer);
-  }, [acceptRoom, roomSocket.room]);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => setConnected(roomSocket.connected), 0);
-    return () => window.clearTimeout(timer);
-  }, [roomSocket.connected]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setError(
@@ -303,9 +272,9 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
 
   useEffect(() => {
     if (room?.game.status !== "playing" && room?.revival?.phase !== "ad") return;
-    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    const timer = window.setInterval(() => setNow(getServerNow()), 250);
     return () => window.clearInterval(timer);
-  }, [room?.game.status, room?.revival?.phase]);
+  }, [room?.game.status, room?.revival?.phase, getServerNow]);
 
   useEffect(() => {
     if (!room?.revival?.createdAt) return;
@@ -345,16 +314,13 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
 
   const persistSession = (next: Session) => {
     uiGenerationRef.current += 1;
-    window.localStorage.setItem(SESSION_KEY, JSON.stringify(next));
     sessionRef.current = next;
     actionQueue.current = Promise.resolve();
-    setPausedSession(null);
     setChatDraft("");
     setSendingChat(false);
     setStickerPickerOpen(false);
     setMembershipAction(null);
     setRevivalDecision(null);
-    setSession(next);
   };
 
   const switchRole = async (targetRole: "player" | "spectator", sourceSession: Session | null = sessionRef.current) => {
@@ -386,13 +352,9 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
       await roomSocket.leaveMembership();
       if (generation !== uiGenerationRef.current || sessionRef.current?.token !== activeSession.token) return;
       uiGenerationRef.current += 1;
-      window.localStorage.removeItem(SESSION_KEY);
       sessionRef.current = null;
       roomRef.current = null;
       actionQueue.current = Promise.resolve();
-      setSession(null);
-      setRoom(null);
-      setPausedSession(null);
       setName("");
       setJoinCode("");
       setChatDraft("");
@@ -440,7 +402,6 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
         if (pausedRole === targetRole) {
           persistSession(pausedSession);
           roomSocket.connect(pausedSession);
-          if (roomSocket.room) acceptRoom(roomSocket.room);
         } else {
           persistSession(pausedSession);
           roomSocket.connect(pausedSession);
@@ -468,13 +429,10 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
 
   const leaveRoom = () => {
     if (membershipAction) return;
-    if (session) setPausedSession(session);
     roomSocket.pause();
     uiGenerationRef.current += 1;
     sessionRef.current = null;
     actionQueue.current = Promise.resolve();
-    setSession(null);
-    setRoom(null);
     setJoinCode("");
     setChatDraft("");
     setSendingChat(false);
@@ -487,20 +445,20 @@ export function MinefieldApp({ initialLocale }: { initialLocale: Locale }) {
     if (!pausedSession || loading) return;
     persistSession(pausedSession);
     roomSocket.connect(pausedSession);
-    if (roomSocket.room) acceptRoom(roomSocket.room);
   };
 
   const commitAction = useCallback((action: GameAction) => {
     const activeSession = sessionRef.current;
     if (!activeSession || activeSession.role === "spectator") return Promise.resolve();
-    const activeRevival = roomRef.current?.revival;
+    const observedRoom = roomRef.current;
+    const activeRevival = observedRoom?.revival;
     const isRevivalDecision = action.type === "watchAd" || action.type === "endGame";
     const generation = uiGenerationRef.current;
     if ((activeRevival && !isRevivalDecision) || (!activeRevival && isRevivalDecision)) return Promise.resolve();
     return actionQueue.current = actionQueue.current.then(async () => {
       if (generation !== uiGenerationRef.current) return;
       try {
-        await roomSocket.sendAction(action);
+        await roomSocket.sendAction(action, observedRoom);
         if (generation !== uiGenerationRef.current || sessionRef.current?.token !== activeSession.token) return;
         setError("");
       } catch (actionError) {

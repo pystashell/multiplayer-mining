@@ -1,3 +1,4 @@
+// These checks inspect source/config contracts; behavior lives in the regression suites.
 import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
@@ -48,7 +49,7 @@ test("uses a hibernating Durable Object instead of room polling", async () => {
   ]);
 
   assert.match(app, /useMineRoomSocket\(\{ autoResume: true \}\)/);
-  assert.match(app, /roomSocket\.sendAction\(action\)/);
+  assert.match(app, /roomSocket\.sendAction\(action, observedRoom\)/);
   assert.match(app, /roomSocket\.sendChat\(message\)/);
   assert.doesNotMatch(app, /pollInterval|setTimeout\([\s\S]{0,200}fetchRoom|900|2_000/);
   assert.match(hook, /new WebSocket\(createSocketUrl/);
