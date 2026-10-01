@@ -1,4 +1,6 @@
 export const MINE_PROTOCOL_VERSION = 2 as const;
+/** Maximum accepted future deadline; receipts must cover this whole interval. */
+export const MAX_COMMAND_LIFETIME_MS = 60_000;
 
 export type Difficulty = "beginner" | "intermediate" | "expert";
 export type CellState = "hidden" | "flagged" | "questioned" | "revealed";

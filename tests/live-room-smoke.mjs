@@ -340,6 +340,15 @@ try {
   assert.equal(guest.room.game.status, "ready");
   assert.equal(guest.room.game.flags, 0);
 
+  const retainedCursor = host.cursor();
+  const retained = host.send({ op: "chat", content: `retained-result-${suffix}` });
+  const retainedAck = await host.waitFor((message) => message.type === "ack" && message.id === retained.id, { startIndex: retainedCursor });
+  const rejectionCursor = host.cursor();
+  const rejected = host.send({ op: "unknown" });
+  const retainedError = await host.waitFor((message) => message.type === "error" && message.id === rejected.id, { startIndex: rejectionCursor });
+  assert.equal(retainedError.code, "BAD_REQUEST");
+  const receiptReplayStartedAt = performance.now();
+
   const guestOfflineCursor = guest.cursor();
   await host.disconnect();
   await guest.waitFor(
@@ -349,6 +358,16 @@ try {
       ),
     { startIndex: guestOfflineCursor },
   );
+
+  // Each accepted no-op creates a receipt without changing the board. Exercise
+  // the former shared 256-entry eviction path through actual workerd sockets.
+  for (let index = 0; index < 256; index++) {
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    const cursor = guest.cursor();
+    const peerCommand = guest.send({ op: "action", action: { type: "mark", index: 0, state: "hidden" } });
+    const outcome = await guest.waitFor((message) => message.id === peerCommand.id && (message.type === "ack" || message.type === "error"), { startIndex: cursor });
+    assert.equal(outcome.type, "ack");
+  }
 
   const guestOnlineCursor = guest.cursor();
   reconnectedHost = new RoomClient(roomCode, host.session);
@@ -366,6 +385,15 @@ try {
       ),
     { startIndex: guestOnlineCursor },
   );
+
+  for (const [envelope, expected] of [[retained, retainedAck], [rejected, retainedError]]) {
+    assert.ok(Date.now() + (reconnectedHost.serverOffset ?? 0) < envelope.expiresAt, "Replay must still be inside the original 30s deadline");
+    const cursor = reconnectedHost.cursor();
+    reconnectedHost.sendRaw(envelope);
+    const replayed = await reconnectedHost.waitFor((message) => message.id === envelope.id && (message.type === "ack" || message.type === "error"), { startIndex: cursor });
+    assert.deepEqual(replayed, expected);
+  }
+  const receiptReplayElapsedMs = Math.round(performance.now() - receiptReplayStartedAt);
 
   const reconnectCursor = reconnectedHost.cursor();
   const reconnectSync = reconnectedHost.send({ op: "sync" });
@@ -483,6 +511,9 @@ try {
     pushLatencyMs,
     chatBroadcastToPeer: true,
     duplicateSequenceWasIdempotent: true,
+    peerReceiptTraffic: 256,
+    successAndRejectionReplayedAfterPeerTraffic: true,
+    receiptReplayElapsedMs,
     reconnectedToSamePlayer: true,
     sequenceRecoveredFromServer: true,
     crossPlayerOldRoundRejected: true,

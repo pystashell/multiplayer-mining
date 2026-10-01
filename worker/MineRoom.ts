@@ -1,5 +1,6 @@
 import {
   MINE_PROTOCOL_VERSION,
+  MAX_COMMAND_LIFETIME_MS,
   isRoomSession,
   isRoomSessionIdentity,
   type CommandMessage,
@@ -22,6 +23,7 @@ import { MessageBudget } from "./message-budget";
 const CORE_KEY = "room:core";
 const CHAT_KEY = "room:chat";
 const RECEIPTS_KEY = "room:receipts";
+const memberReceiptsKey = (playerId: string) => `${RECEIPTS_KEY}:${playerId}`;
 const SEQUENCES_KEY = "room:sequences";
 const MAX_QUEUED_OPERATIONS = 64;
 const MAX_SOCKET_CONNECTIONS = 32;
@@ -104,6 +106,7 @@ export class MineRoom {
   private restoreFailed = false;
   private queuedOperations = 0;
   private readonly budget = new MessageBudget();
+  private persistedReceiptPlayerIds = new Set<string>();
   private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Record<string, never>) {
@@ -121,13 +124,20 @@ export class MineRoom {
       if (!core) return;
 
       try {
+        const receiptKeys = core.members.map((member) => memberReceiptsKey(member.playerId));
+        const memberReceipts = receiptKeys.length
+          ? await ctx.storage.get<CommandReceipt[]>(receiptKeys)
+          : new Map<string, CommandReceipt[]>();
+        this.persistedReceiptPlayerIds = new Set(core.members.map((member) => member.playerId));
         this.engine = MineRoomEngine.restore({
           ...core,
           members: core.members.map((member) => ({
             ...member, lastSequence: sequences?.[member.playerId] ?? member.lastSequence ?? 0,
           })),
           chat: chat ?? [],
-          receipts: receipts ?? [],
+          // Read the old shared partition only when that member has not migrated.
+          receipts: core.members.flatMap((member) => memberReceipts.get(memberReceiptsKey(member.playerId))
+            ?? (receipts ?? []).filter((receipt) => receipt.playerId === member.playerId)),
         });
       } catch (error) {
         console.error("Unable to restore mine room", error);
@@ -471,8 +481,20 @@ export class MineRoom {
       return;
     }
 
+    // Reserve outcome capacity before any mutation. Refusing new work must not
+    // consume a sequence or evict an earlier command that can still be retried.
+    if (message.command.op !== "leaveMembership") {
+      try {
+        this.engine.assertReceiptCapacity(playerId, now);
+      } catch (error) {
+        const normalized = this.normalizeError(error);
+        this.sendError(socket, normalized.code, normalized.message, message.id, normalized.retryable);
+        return;
+      }
+    }
+
     try {
-      if (message.expiresAt <= now || message.expiresAt > now + 60_000) {
+      if (message.expiresAt <= now || message.expiresAt > now + MAX_COMMAND_LIFETIME_MS) {
         throw new MineRoomEngineError("这条命令已经过期。", 409, "COMMAND_EXPIRED");
       }
       const result = this.applyCommand(playerId, message.command);
@@ -567,13 +589,25 @@ export class MineRoom {
     const serialized = this.engine.serialize();
     const { chat, receipts, ...core } = serialized;
     const sequences = Object.fromEntries(core.members.map((member) => [member.playerId, member.lastSequence]));
+    const receiptPartitions = Object.fromEntries(core.members.map((member) => [
+      memberReceiptsKey(member.playerId), receipts.filter((receipt) => receipt.playerId === member.playerId),
+    ]));
+    const memberIds = new Set(core.members.map((member) => member.playerId));
+    const removedKeys = [...this.persistedReceiptPlayerIds]
+      .filter((playerId) => !memberIds.has(playerId)).map(memberReceiptsKey);
     // Sequence watermarks and receipts are committed together, including no-ops.
-    // Core also carries a fallback watermark for migration from older rooms.
-    await this.ctx.storage.put({
+    // Per-member keys keep the retained window below the storage value limit.
+    // Issue writes/deletes without an intervening await so storage coalesces
+    // them atomically; departing members must not leave unbounded stale keys.
+    const writes = [this.ctx.storage.put({
       ...(!receiptsOnly ? { [CORE_KEY]: core, [CHAT_KEY]: chat } : {}),
-      [RECEIPTS_KEY]: receipts,
+      [RECEIPTS_KEY]: [],
+      ...receiptPartitions,
       [SEQUENCES_KEY]: sequences,
-    });
+    })];
+    if (removedKeys.length) writes.push(this.ctx.storage.delete(removedKeys).then(() => undefined));
+    await Promise.all(writes);
+    this.persistedReceiptPlayerIds = memberIds;
   }
 
   private async advanceRoom(): Promise<void> {

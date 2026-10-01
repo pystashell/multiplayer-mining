@@ -9,6 +9,7 @@ import {
 import {
   isRoomCode,
   isStickerId,
+  MAX_COMMAND_LIFETIME_MS,
   STICKER_FALLBACKS,
   type ChatMessage,
   type Difficulty,
@@ -35,9 +36,11 @@ export const CHAT_RATE_LIMIT = 8;
 export const CHAT_RATE_WINDOW_MS = 30_000;
 export const REVIVAL_AD_MS = 10_000;
 export const RESERVATION_TTL_MS = 60_000;
+// Covers the member budget's 30-command burst plus 15/s for the full 60s window.
+// Admission still checks this bound, including after the budget resets on wakeup.
+export const MAX_RECEIPTS_PER_MEMBER = 1_024;
 
 const SERIALIZED_SCHEMA_VERSION = 1 as const;
-const MAX_RECEIPTS = 256;
 const TOKEN_HASH_PATTERN = /^[a-f0-9]{64}$/;
 
 type LosingWireAction = Extract<WireAction, { type: "reveal" | "chord" }>;
@@ -480,7 +483,8 @@ export class MineRoomEngine {
     validateRestoredState(state);
     state.chat = state.chat.slice(-MAX_CHAT_MESSAGES);
     state.activity = state.activity.slice(0, MAX_ACTIVITY);
-    state.receipts = (state.receipts ?? []).slice(-MAX_RECEIPTS);
+    // Never truncate unexpired outcomes while reconstructing a room.
+    state.receipts ??= [];
     state.chatRates ??= {};
     // Existing rooms cannot distinguish old reservations from paused players.
     // Preserve those memberships; only new reservations receive a deadline.
@@ -922,6 +926,17 @@ export class MineRoomEngine {
     return { kind: "new", previousSequence: member.lastSequence };
   }
 
+  assertReceiptCapacity(playerId: string, nowInput?: number): void {
+    const now = readNow(nowInput);
+    this.requireMember(playerId);
+    this.state.receipts = this.state.receipts.filter(
+      (receipt) => receipt.createdAt + MAX_COMMAND_LIFETIME_MS > now,
+    );
+    if (this.state.receipts.filter((receipt) => receipt.playerId === playerId).length >= MAX_RECEIPTS_PER_MEMBER) {
+      throw new MineRoomEngineError("操作太频繁，请稍后再试。", 429, "RATE_LIMITED", true);
+    }
+  }
+
   recordSequence(input: {
     playerId: string;
     id: string;
@@ -935,6 +950,7 @@ export class MineRoomEngine {
     if (decision.kind === "stale") {
       throw new MineRoomEngineError("这条命令已经过期。", 409, "CONFLICT");
     }
+    this.assertReceiptCapacity(input.playerId, now);
     const member = this.requireMember(input.playerId);
     member.lastSequence = input.sequence;
     const receipt: CommandReceipt = {
@@ -947,7 +963,6 @@ export class MineRoomEngine {
       ...(input.error ? { error: clone(input.error) } : {}),
     };
     this.state.receipts.push(receipt);
-    this.state.receipts = this.state.receipts.slice(-MAX_RECEIPTS);
     return clone(receipt);
   }
 

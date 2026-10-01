@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MineRoomEngine, RESERVATION_TTL_MS, REVIVAL_AD_MS } from "../shared/mine-room-engine.ts";
-import { MINE_PROTOCOL_VERSION as v } from "../shared/mine-protocol.ts";
+import { MineRoomEngine, MAX_RECEIPTS_PER_MEMBER, RESERVATION_TTL_MS, REVIVAL_AD_MS } from "../shared/mine-room-engine.ts";
+import { MINE_PROTOCOL_VERSION as v, MAX_COMMAND_LIFETIME_MS } from "../shared/mine-protocol.ts";
 import { MineRoom } from "../worker/MineRoom.ts";
 import worker from "../worker/index.ts";
 
@@ -38,8 +38,13 @@ async function adapter(serialized, sockets = []) {
   let ready;
   const ctx = {
     storage: {
-      async get(key) { return structuredClone(values.get(key)); },
+      async get(key) {
+        return Array.isArray(key)
+          ? new Map(key.filter((entry) => values.has(entry)).map((entry) => [entry, structuredClone(values.get(entry))]))
+          : structuredClone(values.get(key));
+      },
       async put(entries) { writes.push(structuredClone(entries)); for (const [key, value] of Object.entries(entries)) values.set(key, structuredClone(value)); },
+      async delete(keys) { return keys.filter((key) => values.delete(key)).length; },
       async getAlarm() { return alarm; }, async setAlarm(value) { alarm = value; }, async deleteAlarm() { alarm = null; },
       async deleteAll() { deleted++; values.clear(); },
     },
@@ -178,6 +183,153 @@ test("F03: queue admission stays bounded while storage is stalled", async () => 
   release();
   await Promise.all(work);
   assert.ok(fixture.writes.length <= 64);
+});
+
+test("review: another member cannot evict a receipt inside its retry window", async () => {
+  const now = Date.now();
+  const engine = await engineAt(now);
+  engine.join({ name: "Guest", role: "player", playerId: "guest", tokenHash: await hash("guest"), now });
+  const original = engine.recordSequence({ playerId: "host", id: "lost-ack", sequence: 1, now });
+  for (let sequence = 1; sequence <= 256; sequence++) {
+    engine.recordSequence({ playerId: "guest", id: `guest-${sequence}`, sequence, now: now + sequence * 70 });
+  }
+  assert.deepEqual(engine.inspectSequence("host", "lost-ack", 1), { kind: "duplicate", receipt: original });
+  assert.deepEqual(MineRoomEngine.restore(engine.serialize()).inspectSequence("host", "lost-ack", 1), { kind: "duplicate", receipt: original });
+});
+
+test("review: reconnect after peer traffic replays both success and rejection after rebuild", async (t) => {
+  let now = 1_000_000;
+  t.mock.method(Date, "now", () => now);
+  const engine = await engineAt(now);
+  engine.join({ name: "Guest", role: "player", playerId: "guest", tokenHash: await hash("guest"), now });
+  await engine.connect({ playerId: "guest", token: "guest", connectionId: "guest-connection", now });
+  engine.handleAction({ playerId: "host", action: { type: "reveal", index: 40 }, now });
+  const host = socket(); const guest = socket("guest");
+  const sockets = [host, guest];
+  const fixture = await adapter(engine.serialize(), sockets);
+  const accepted = command(engine, 1, null, { command: { op: "chat", content: "Only once" } });
+  const rejected = command(engine, 2, null, { command: { op: "unknown" } });
+  for (const message of [accepted, rejected]) await send(fixture.room, host, message);
+  const expected = [accepted, rejected].map(({ id }) => host.sent.find((message) => message.id === id));
+  assert.equal(expected[0].type, "ack");
+  assert.equal(expected[1].code, "BAD_REQUEST");
+  await fixture.room.webSocketClose(host, 1000, "Lost acknowledgement");
+  sockets.splice(0, 1);
+  for (let sequence = 1; sequence <= 256; sequence++) {
+    now += 70;
+    await send(fixture.room, guest, command(engine, sequence, { type: "reveal", index: 40 }));
+  }
+  assert.equal(guest.sent.filter((message) => message.type === "ack").length, 256);
+  let ready;
+  fixture.ctx.blockConcurrencyWhile = (fn) => { ready = fn(); };
+  const rebuilt = new MineRoom(fixture.ctx, {});
+  await ready;
+  const reconnected = socket("host", false);
+  sockets.push(reconnected);
+  await send(rebuilt, reconnected, { v, type: "join", session: { code: "ABC234", playerId: "host", playerName: "Host", role: "player", token } });
+  assert.equal(reconnected.sent.find((message) => message.type === "welcome").lastAcceptedSequence, 2);
+  const writesBeforeReplay = fixture.writes.length;
+  for (let index = 0; index < 2; index++) {
+    const message = [accepted, rejected][index];
+    assert.ok(now < message.expiresAt);
+    await send(rebuilt, reconnected, message);
+    assert.deepEqual(reconnected.sent.findLast((reply) => reply.id === message.id), expected[index]);
+  }
+  assert.equal(fixture.writes.length, writesBeforeReplay);
+  assert.equal(fixture.values.get("room:chat").filter((message) => message.content === "Only once").length, 1);
+});
+
+test("review: one member's own allowed traffic preserves earlier rejected outcomes", async () => {
+  const now = Date.now();
+  const engine = await engineAt(now);
+  const original = engine.recordSequence({ playerId: "host", id: "rejected", sequence: 1, now,
+    error: { code: "BAD_REQUEST", message: "Original rejection", retryable: false } });
+  // 451 commands in 29.25s fit the 30-burst + 15/s admission budget.
+  for (let index = 1; index <= 450; index++) {
+    engine.recordSequence({ playerId: "host", id: `later-${index}`, sequence: index + 1, now: now + index * 65 });
+  }
+  assert.deepEqual(MineRoomEngine.restore(engine.serialize()).inspectSequence("host", "rejected", 1), { kind: "duplicate", receipt: original });
+});
+
+test("review: full receipt capacity rejects before mutation, isolates peers and frees only expired outcomes", async (t) => {
+  const startedAt = 1_000_000;
+  let now = startedAt;
+  t.mock.method(Date, "now", () => now);
+  const engine = await engineAt(now);
+  engine.join({ name: "Guest", role: "player", playerId: "guest", tokenHash: await hash("guest"), now });
+  await engine.connect({ playerId: "guest", token: "guest", connectionId: "guest-connection", now });
+  for (let sequence = 1; sequence <= MAX_RECEIPTS_PER_MEMBER; sequence++) {
+    engine.recordSequence({ playerId: "host", id: `retained-${sequence}`, sequence, now });
+  }
+  assert.throws(() => engine.recordSequence({ playerId: "host", id: "overflow", sequence: MAX_RECEIPTS_PER_MEMBER + 1, now }), { code: "RATE_LIMITED" });
+  assert.equal(engine.lastAcceptedSequence("host"), MAX_RECEIPTS_PER_MEMBER);
+  const host = socket(); const guest = socket("guest");
+  const fixture = await adapter(engine.serialize(), [host, guest]);
+  const next = command(engine, MAX_RECEIPTS_PER_MEMBER + 1, null, { command: { op: "chat", content: "After capacity frees" } });
+  await send(fixture.room, host, next);
+  assert.equal(host.sent.at(-1).code, "RATE_LIMITED");
+  assert.equal(fixture.writes.length, 0);
+  assert.equal(fixture.values.get("room:chat").length, 0);
+  const duplicate = command(engine, 1, null, { id: "retained-1" });
+  await send(fixture.room, host, duplicate);
+  assert.equal(host.sent.at(-1).type, "ack");
+  await send(fixture.room, guest, command(engine, 1, null, { command: { op: "chat", content: "Peer still works" } }));
+  assert.equal(guest.sent.findLast((message) => message.id === "command-1").type, "ack");
+  assert.equal(fixture.values.get("room:sequences").host, MAX_RECEIPTS_PER_MEMBER);
+  assert.equal(fixture.values.get("room:receipts:host").length, MAX_RECEIPTS_PER_MEMBER);
+  now = startedAt + MAX_COMMAND_LIFETIME_MS - 1;
+  next.expiresAt = now + 30_000;
+  await send(fixture.room, host, next);
+  assert.equal(host.sent.at(-1).code, "RATE_LIMITED");
+  now++;
+  await send(fixture.room, host, next);
+  assert.equal(host.sent.findLast((message) => message.id === next.id).type, "ack");
+  assert.equal(fixture.values.get("room:receipts:host").length, 1);
+  assert.equal(fixture.values.get("room:sequences").host, next.sequence);
+  await send(fixture.room, host, duplicate);
+  assert.equal(host.sent.findLast((message) => message.id === duplicate.id).code, "STALE_SEQUENCE");
+  assert.equal(fixture.values.get("room:chat").filter((message) => message.content === "After capacity frees").length, 1);
+});
+
+test("review: maximum accepted deadline stays replayable through its last millisecond", async (t) => {
+  const startedAt = 1_000_000;
+  let now = startedAt;
+  t.mock.method(Date, "now", () => now);
+  const engine = await engineAt(now);
+  const host = socket();
+  const fixture = await adapter(engine.serialize(), [host]);
+  const original = command(engine, 1, null, { expiresAt: now + MAX_COMMAND_LIFETIME_MS, command: { op: "chat", content: "Long deadline" } });
+  await send(fixture.room, host, original);
+  const ack = host.sent.find((message) => message.id === original.id);
+  now = startedAt + MAX_COMMAND_LIFETIME_MS - 1;
+  await send(fixture.room, host, command(engine, 2, null, { command: { op: "chat", content: "Triggers expiry cleanup" } }));
+  await send(fixture.room, host, original);
+  assert.deepEqual(host.sent.findLast((message) => message.id === original.id), ack);
+});
+
+test("review: legacy receipts migrate without loss and departed member partitions are removed", async () => {
+  const engine = await engineAt(Date.now());
+  const original = engine.recordSequence({ playerId: "host", id: "legacy", sequence: 1 });
+  const host = socket();
+  const fixture = await adapter(engine.serialize(), [host]);
+  await send(fixture.room, host, command(engine, 2, null, { command: { op: "chat", content: "Migrate" } }));
+  assert.deepEqual(fixture.values.get("room:receipts"), []);
+  assert.deepEqual(fixture.values.get("room:receipts:host")[0], original);
+  let ready;
+  fixture.ctx.blockConcurrencyWhile = (fn) => { ready = fn(); };
+  const rebuilt = new MineRoom(fixture.ctx, {});
+  await ready;
+  await send(rebuilt, host, command(engine, 1, null, { id: "legacy" }));
+  assert.equal(host.sent.at(-1).type, "ack");
+  await send(rebuilt, host, command(engine, 3, null, { command: { op: "leaveMembership" } }));
+  assert.equal(fixture.values.has("room:receipts:host"), false);
+  assert.deepEqual(fixture.values.get("room:sequences"), {});
+  fixture.ctx.getWebSockets = () => [];
+  const emptyRoom = new MineRoom(fixture.ctx, {});
+  await ready;
+  const response = await emptyRoom.fetch(new Request("https://local/internal/join", { method: "POST", body: JSON.stringify({ name: "New", role: "player", playerId: "new", tokenHash: await hash("new") }) }));
+  assert.equal(response.status, 201);
+  assert.equal(fixture.values.has("room:receipts:host"), false);
 });
 
 for (const action of [{ type: "reveal", index: 0 }, { type: "mark", index: 0, state: "flagged" }, { type: "chord", index: 0 }, { type: "restart" }]) {
