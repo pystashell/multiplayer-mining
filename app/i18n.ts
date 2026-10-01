@@ -508,9 +508,14 @@ const ERROR_CODE_EN: Record<string, string> = {
   CONFLICT: "The room changed at the same time. Please try again.",
   NOT_CONNECTED: "The room connection is not ready yet.",
   COMMAND_TIMEOUT: "The action timed out. The room has been resynced.",
+  COMMAND_EXPIRED: "The command expired before it could be applied. Please try again.",
   INVALID_ROOM_CODE: "Room codes must contain 6 letters or numbers.",
   INVALID_NAME: "Please enter your name.",
   SESSION_REPLACED: "This identity reconnected in another window.",
+  STALE_ROUND: "That move belongs to an earlier round. The current board has been synced.",
+  STALE_SEQUENCE: "That command is out of date. New commands will use the server's sequence number.",
+  RECOVERY_FAILED: "The saved room could not be restored. Its data has been preserved.",
+  PROTOCOL_MISMATCH: "The client protocol is out of date. Please refresh the page.",
 };
 
 export function translateServerMessage(locale: Locale, code: string | undefined, message: string): string {

@@ -1,4 +1,6 @@
-export const MINE_PROTOCOL_VERSION = 1 as const;
+export const MINE_PROTOCOL_VERSION = 2 as const;
+/** Maximum accepted future deadline; receipts must cover this whole interval. */
+export const MAX_COMMAND_LIFETIME_MS = 60_000;
 
 export type Difficulty = "beginner" | "intermediate" | "expert";
 export type CellState = "hidden" | "flagged" | "questioned" | "revealed";
@@ -36,6 +38,7 @@ export type PublicCell = {
 };
 
 export type PublicGame = {
+  revision: number;
   difficulty: Difficulty;
   width: number;
   height: number;
@@ -93,6 +96,7 @@ export type RoomRevival = {
 
 export type PublicRoom = {
   code: string;
+  roundId: string;
   version: number;
   game: PublicGame;
   players: RoomPlayer[];
@@ -152,6 +156,8 @@ export type JoinRoomRequest = {
   v: typeof MINE_PROTOCOL_VERSION;
   name: string;
   role: RoomRole;
+  /** A secret, random 32-byte retry key; never put it in URLs or logs. */
+  idempotencyKey?: string;
 };
 
 export type JoinRoomResponse = {
@@ -170,7 +176,7 @@ export type JoinMessage = {
 };
 
 export type RoomCommand =
-  | { op: "action"; action: WireAction }
+  | { op: "action"; action: WireAction; roundId: string; observedGameRevision?: number }
   | { op: "chat"; content: string; stickerId?: StickerId }
   | { op: "switchRole"; targetRole: RoomRole }
   | { op: "leaveMembership" }
@@ -181,6 +187,7 @@ export type CommandMessage = {
   type: "command";
   id: string;
   sequence: number;
+  expiresAt: number;
   command: RoomCommand;
 };
 
@@ -195,6 +202,7 @@ export type WelcomeMessage = {
   v: typeof MINE_PROTOCOL_VERSION;
   type: "welcome";
   identity: RoomSessionIdentity;
+  lastAcceptedSequence: number;
   snapshot: RoomSnapshot;
 };
 
@@ -227,6 +235,7 @@ export type ErrorMessage = {
   code: string;
   message: string;
   retryable?: boolean;
+  lastAcceptedSequence?: number;
 };
 
 export type ServerMessage =
@@ -298,7 +307,8 @@ export function isServerMessage(value: unknown): value is ServerMessage {
   }
 
   if (value.type === "welcome") {
-    return isRoomSessionIdentity(value.identity) && isRecord(value.snapshot);
+    return isRoomSessionIdentity(value.identity) && isRecord(value.snapshot)
+      && Number.isSafeInteger(value.lastAcceptedSequence) && Number(value.lastAcceptedSequence) >= 0;
   }
   if (value.type === "snapshot") return isRecord(value.snapshot);
   if (value.type === "session") return isRoomSessionIdentity(value.identity);

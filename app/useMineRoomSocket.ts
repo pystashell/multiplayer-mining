@@ -32,7 +32,9 @@ const STORAGE_PREFIX = "shared-minefield.socket.v1";
 const LAST_ROOM_KEY = `${STORAGE_PREFIX}.last`;
 const LEGACY_SESSION_KEY = "shared-minefield-session-v1";
 const RECONNECT_DELAYS = [500, 1_000, 2_000, 4_000, 7_500, 10_000] as const;
-const PING_INTERVAL_MS = 60_000;
+const PING_INTERVAL_MS = 25_000;
+const PONG_TIMEOUT_MS = 10_000;
+const WELCOME_TIMEOUT_MS = 10_000;
 const COMMAND_TIMEOUT_MS = 30_000;
 
 export type MineRoomConnectionStatus =
@@ -221,6 +223,7 @@ function isPublicRoom(value: unknown): value is PublicRoom {
   return (
     typeof value.code === "string" &&
     isRoomCode(value.code) &&
+    typeof value.roundId === "string" &&
     Number.isSafeInteger(value.version) &&
     isRecord(value.game) &&
     Array.isArray(value.players) &&
@@ -293,6 +296,12 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
   const sessionRef = useRef<RoomSession | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const pingTimerRef = useRef<number | null>(null);
+  const pongTimerRef = useRef<number | null>(null);
+  const welcomeTimerRef = useRef<number | null>(null);
+  const pongDeadlineRef = useRef<number | null>(null);
+  const lastPongRef = useRef(0);
+  const snapshotRef = useRef<PublicRoom | null>(null);
+  const joinAttemptRef = useRef<{ request: string; key: string } | null>(null);
   const reconnectAttemptRef = useRef(0);
   const connectionGenerationRef = useRef(0);
   const sequenceRef = useRef(0);
@@ -328,6 +337,11 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
       window.clearInterval(pingTimerRef.current);
       pingTimerRef.current = null;
     }
+    if (pongTimerRef.current !== null) window.clearTimeout(pongTimerRef.current);
+    if (welcomeTimerRef.current !== null) window.clearTimeout(welcomeTimerRef.current);
+    pongTimerRef.current = null;
+    welcomeTimerRef.current = null;
+    pongDeadlineRef.current = null;
   }, []);
 
   const updateServerTime = useCallback((serverTime: number) => {
@@ -394,11 +408,13 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
     sessionRef.current = null;
     sequenceRef.current = 0;
     lastVersionRef.current = 0;
+    snapshotRef.current = null;
     setSession(null);
     setRoom(null);
   }, []);
 
   const armPendingTimeout = useCallback((pending: PendingCommand) => {
+    if (pendingCommandsRef.current.get(pending.message.id) !== pending) return false;
     if (pending.timer !== null) window.clearTimeout(pending.timer);
     const remaining = pending.expiresAt - Date.now();
     if (remaining <= 0) {
@@ -408,7 +424,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
       );
       needsPostWelcomeSyncRef.current = true;
       if (welcomedRef.current) requestSyncRef.current();
-      return;
+      return false;
     }
     pending.timer = window.setTimeout(() => {
       settlePendingWithError(
@@ -418,9 +434,12 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
       needsPostWelcomeSyncRef.current = true;
       if (welcomedRef.current) requestSyncRef.current();
     }, remaining);
+    return true;
   }, [settlePendingWithError]);
 
   const sendEnvelope = useCallback((message: CommandMessage): boolean => {
+    const pending = pendingCommandsRef.current.get(message.id);
+    if (!pending || pending.expiresAt <= Date.now()) return false;
     const socket = socketRef.current;
     if (!welcomedRef.current || !socket || socket.readyState !== WebSocket.OPEN) return false;
     try {
@@ -447,6 +466,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
       type: "command",
       id: createMessageId(),
       sequence,
+      expiresAt: Date.now() + serverTimeOffsetRef.current + COMMAND_TIMEOUT_MS,
       command,
     };
 
@@ -459,8 +479,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
         reject,
       };
       pendingCommandsRef.current.set(message.id, pending);
-      armPendingTimeout(pending);
-      if (!sendEnvelope(message)) {
+      if (armPendingTimeout(pending) && !sendEnvelope(message)) {
         needsPostWelcomeSyncRef.current = true;
         // Keep the exact envelope pending. The welcome handler re-sends it
         // after a connecting or reconnecting socket has authenticated.
@@ -491,20 +510,54 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
     requestSyncRef.current = requestSync;
   }, [requestSync]);
 
+  const reconnectUnresponsive = useCallback((socket: WebSocket) => {
+    if (socketRef.current !== socket || intentionalCloseRef.current || !mountedRef.current) return;
+    ++connectionGenerationRef.current;
+    socketRef.current = null;
+    welcomedRef.current = false;
+    clearPingTimer();
+    clearReconnectTimer();
+    needsPostWelcomeSyncRef.current = true;
+    setStatus("reconnecting");
+    if (socket.readyState < WebSocket.CLOSING) socket.close(4000, "Heartbeat or welcome timeout");
+    const delay = RECONNECT_DELAYS[Math.min(reconnectAttemptRef.current++, RECONNECT_DELAYS.length - 1)];
+    reconnectTimerRef.current = window.setTimeout(() => {
+      const activeSession = sessionRef.current;
+      if (activeSession && mountedRef.current && !intentionalCloseRef.current) openSocketRef.current(activeSession, true);
+    }, delay);
+  }, [clearPingTimer, clearReconnectTimer]);
+
+  const checkLiveness = useCallback(() => {
+    const socket = socketRef.current;
+    if (!welcomedRef.current || !socket) return;
+    if (socket.readyState !== WebSocket.OPEN) return reconnectUnresponsive(socket);
+    if (pongDeadlineRef.current !== null) {
+      if (Date.now() >= pongDeadlineRef.current) reconnectUnresponsive(socket);
+      return;
+    }
+    if (Date.now() - lastPongRef.current < PING_INTERVAL_MS) return;
+    pongDeadlineRef.current = Date.now() + PONG_TIMEOUT_MS;
+    pongTimerRef.current = window.setTimeout(() => reconnectUnresponsive(socket), PONG_TIMEOUT_MS);
+    try {
+      // This exact frame is answered without waking a hibernating object.
+      socket.send("ping");
+    } catch {
+      reconnectUnresponsive(socket);
+    }
+  }, [reconnectUnresponsive]);
+
   const schedulePing = useCallback(() => {
     clearPingTimer();
-    pingTimerRef.current = window.setInterval(() => {
-      const socket = socketRef.current;
-      if (!welcomedRef.current || !socket || socket.readyState !== WebSocket.OPEN) return;
-      try {
-        // The Durable Object answers this exact frame through an auto-response,
-        // so a quiet room can stay hibernated.
-        socket.send("ping");
-      } catch {
-        needsPostWelcomeSyncRef.current = true;
-      }
-    }, PING_INTERVAL_MS);
-  }, [clearPingTimer]);
+    lastPongRef.current = Date.now();
+    pingTimerRef.current = window.setInterval(checkLiveness, PING_INTERVAL_MS);
+  }, [checkLiveness, clearPingTimer]);
+
+  const mergeSequenceWatermark = useCallback((watermark: number | undefined) => {
+    if (!Number.isSafeInteger(watermark) || watermark === undefined || watermark < 0) return;
+    sequenceRef.current = Math.max(sequenceRef.current, watermark,
+      ...[...pendingCommandsRef.current.values()].map((item) => item.message.sequence));
+    if (sessionRef.current) saveSequence(sessionRef.current, sequenceRef.current);
+  }, []);
 
   const acceptSnapshot = useCallback(
     (snapshot: RoomSnapshot, source: "welcome" | "snapshot") => {
@@ -513,6 +566,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
       // Equal revisions are valid (for example, a reconnect or presence-only refresh).
       if (source !== "welcome" && snapshot.room.version < lastVersionRef.current) return;
       lastVersionRef.current = snapshot.room.version;
+      snapshotRef.current = snapshot.room;
       updateServerTime(snapshot.serverTime);
       setRoom(snapshot.room);
       callbacksRef.current.onSnapshot?.(snapshot.room, source);
@@ -533,6 +587,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
         return;
       }
       persistSession(nextSession);
+      mergeSequenceWatermark(message.lastAcceptedSequence);
       welcomedRef.current = true;
       reconnectAttemptRef.current = 0;
       setStatus("connected");
@@ -547,8 +602,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
         (left, right) => left.message.sequence - right.message.sequence,
       );
       for (const item of pending) {
-        armPendingTimeout(item);
-        sendEnvelope(item.message);
+        if (armPendingTimeout(item)) sendEnvelope(item.message);
       }
       if (needsPostWelcomeSyncRef.current || pending.length > 0) {
         needsPostWelcomeSyncRef.current = false;
@@ -587,6 +641,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
     }
 
     if (message.type === "error") {
+      mergeSequenceWatermark(message.lastAcceptedSequence);
       const socketError = new MineRoomSocketError(
         message.code,
         message.message,
@@ -601,6 +656,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
     }
   }, [
     acceptSnapshot,
+    mergeSequenceWatermark,
     armPendingTimeout,
     persistSession,
     reportError,
@@ -619,6 +675,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
       rejectAllPending(new MineRoomSocketError("SESSION_CHANGED", "房间身份已切换。"));
       sequenceRef.current = readSequence(nextSession);
       lastVersionRef.current = 0;
+      snapshotRef.current = null;
     } else {
       sequenceRef.current = Math.max(sequenceRef.current, readSequence(nextSession));
     }
@@ -645,6 +702,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
       return;
     }
     socketRef.current = socket;
+    welcomeTimerRef.current = window.setTimeout(() => reconnectUnresponsive(socket), WELCOME_TIMEOUT_MS);
 
     socket.addEventListener("open", () => {
       if (generation !== connectionGenerationRef.current) return;
@@ -662,7 +720,17 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
       if (generation !== connectionGenerationRef.current) return;
       try {
         const rawMessage = String(event.data);
-        if (rawMessage === "pong") return;
+        if (rawMessage === "pong") {
+          if (pongDeadlineRef.current !== null && Date.now() >= pongDeadlineRef.current) {
+            reconnectUnresponsive(socket);
+            return;
+          }
+          lastPongRef.current = Date.now();
+          pongDeadlineRef.current = null;
+          if (pongTimerRef.current !== null) window.clearTimeout(pongTimerRef.current);
+          pongTimerRef.current = null;
+          return;
+        }
         const parsed: unknown = JSON.parse(rawMessage);
         if (!isServerMessage(parsed)) {
           reportError({ code: "BAD_SERVER_MESSAGE", message: "房间服务返回了无法识别的消息。" });
@@ -731,6 +799,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
     rejectAllPending,
     reportError,
     resolvePendingLeave,
+    reconnectUnresponsive,
   ]);
 
   useEffect(() => {
@@ -828,7 +897,12 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
     stopCurrentConnection("joining");
     const requestGeneration = connectionGenerationRef.current;
     setError(null);
-    const request: JoinRoomRequest = { v: MINE_PROTOCOL_VERSION, name, role };
+    const attempt = JSON.stringify([roomCode, name, role]);
+    if (joinAttemptRef.current?.request !== attempt) {
+      const bytes = crypto.getRandomValues(new Uint8Array(32));
+      joinAttemptRef.current = { request: attempt, key: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("") };
+    }
+    const request: JoinRoomRequest = { v: MINE_PROTOCOL_VERSION, name, role, idempotencyKey: joinAttemptRef.current.key };
     try {
       const response = await fetch(`/api/rooms/${roomCode}`, {
         method: "POST",
@@ -841,6 +915,7 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
         }),
       });
       const membership = await readMembershipResponse(response, "加入房间失败，请稍后再试。");
+      joinAttemptRef.current = null;
       if (!mountedRef.current || connectionGenerationRef.current !== requestGeneration) return null;
       if (membership.room) {
         lastVersionRef.current = membership.room.version;
@@ -877,7 +952,12 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
   }, [connect]);
 
   const sendAction = useCallback(
-    (action: WireAction) => sendCommand({ op: "action", action }),
+    (action: WireAction, observed = snapshotRef.current) => {
+      if (!observed) return Promise.reject(new MineRoomSocketError("NOT_READY", "房间连接尚未准备好。", true));
+      return sendCommand({ op: "action", action, roundId: observed.roundId,
+        ...((action.type === "restart" || action.type === "changeDifficulty") ? { observedGameRevision: observed.game.revision } : {}),
+      });
+    },
     [sendCommand],
   );
 
@@ -910,6 +990,20 @@ export function useMineRoomSocket(options: UseMineRoomSocketOptions = {}) {
 
   const clearError = useCallback(() => setError(null), []);
   const getServerNow = useCallback(() => Date.now() + serverTimeOffsetRef.current, []);
+
+  useEffect(() => {
+    const checkOnResume = () => {
+      if (document.visibilityState === "hidden" || intentionalCloseRef.current) return;
+      if (socketRef.current) checkLiveness();
+      else if (sessionRef.current && reconnectTimerRef.current === null) openSocketRef.current(sessionRef.current, true);
+    };
+    window.addEventListener("online", checkOnResume);
+    document.addEventListener("visibilitychange", checkOnResume);
+    return () => {
+      window.removeEventListener("online", checkOnResume);
+      document.removeEventListener("visibilitychange", checkOnResume);
+    };
+  }, [checkLiveness]);
 
   useEffect(() => {
     mountedRef.current = true;

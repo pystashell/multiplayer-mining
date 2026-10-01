@@ -1,0 +1,32 @@
+name: checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run cf:typegen
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - name: Real workerd room smoke
+        run: |
+          npm run start > /tmp/minefield-preview.log 2>&1 &
+          trap 'kill $! 2>/dev/null || true' EXIT
+          for attempt in {1..60}; do
+            if curl -fsS http://127.0.0.1:8787/api/rooms/health; then break; fi
+            sleep 1
+          done
+          npm run test:live
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: workerd-log
+          path: /tmp/minefield-preview.log

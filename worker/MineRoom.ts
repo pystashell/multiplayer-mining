@@ -1,5 +1,6 @@
 import {
   MINE_PROTOCOL_VERSION,
+  MAX_COMMAND_LIFETIME_MS,
   isRoomSession,
   isRoomSessionIdentity,
   type CommandMessage,
@@ -17,10 +18,14 @@ import {
   type RoomIdentity,
   type SerializedMineRoomState,
 } from "../shared/mine-room-engine";
+import { MessageBudget } from "./message-budget";
 
 const CORE_KEY = "room:core";
 const CHAT_KEY = "room:chat";
 const RECEIPTS_KEY = "room:receipts";
+const memberReceiptsKey = (playerId: string) => `${RECEIPTS_KEY}:${playerId}`;
+const SEQUENCES_KEY = "room:sequences";
+const MAX_QUEUED_OPERATIONS = 64;
 const MAX_SOCKET_CONNECTIONS = 32;
 const MAX_PENDING_SOCKET_CONNECTIONS = 8;
 const MAX_CLIENT_MESSAGE_BYTES = 4 * 1024;
@@ -89,6 +94,7 @@ function isCommandMessage(value: unknown): value is CommandMessage {
     && value.id.length <= 128
     && Number.isSafeInteger(value.sequence)
     && Number(value.sequence) > 0
+    && typeof value.expiresAt === "number" && Number.isFinite(value.expiresAt)
     && isRecord(value.command)
     && typeof value.command.op === "string";
 }
@@ -97,6 +103,10 @@ export class MineRoom {
   private readonly ctx: DurableObjectState;
   private engine: MineRoomEngine | null = null;
   private retiring = false;
+  private restoreFailed = false;
+  private queuedOperations = 0;
+  private readonly budget = new MessageBudget();
+  private persistedReceiptPlayerIds = new Set<string>();
   private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Record<string, never>) {
@@ -105,23 +115,35 @@ export class MineRoom {
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
 
     ctx.blockConcurrencyWhile(async () => {
-      const [core, chat, receipts] = await Promise.all([
+      const [core, chat, receipts, sequences] = await Promise.all([
         ctx.storage.get<StoredCore>(CORE_KEY),
         ctx.storage.get<SerializedMineRoomState["chat"]>(CHAT_KEY),
         ctx.storage.get<SerializedMineRoomState["receipts"]>(RECEIPTS_KEY),
+        ctx.storage.get<Record<string, number>>(SEQUENCES_KEY),
       ]);
       if (!core) return;
 
       try {
+        const receiptKeys = core.members.map((member) => memberReceiptsKey(member.playerId));
+        const memberReceipts = receiptKeys.length
+          ? await ctx.storage.get<CommandReceipt[]>(receiptKeys)
+          : new Map<string, CommandReceipt[]>();
+        this.persistedReceiptPlayerIds = new Set(core.members.map((member) => member.playerId));
         this.engine = MineRoomEngine.restore({
           ...core,
+          members: core.members.map((member) => ({
+            ...member, lastSequence: sequences?.[member.playerId] ?? member.lastSequence ?? 0,
+          })),
           chat: chat ?? [],
-          receipts: receipts ?? [],
+          // Read the old shared partition only when that member has not migrated.
+          receipts: core.members.flatMap((member) => memberReceipts.get(memberReceiptsKey(member.playerId))
+            ?? (receipts ?? []).filter((receipt) => receipt.playerId === member.playerId)),
         });
       } catch (error) {
         console.error("Unable to restore mine room", error);
         this.engine = null;
-        await ctx.storage.deleteAll();
+        this.restoreFailed = true;
+        for (const socket of ctx.getWebSockets()) this.closeSocket(socket, 1011, "Room recovery failed");
         return;
       }
 
@@ -155,6 +177,7 @@ export class MineRoom {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (this.restoreFailed) return jsonResponse({ error: "房间状态恢复失败，原始数据已保留。", code: "RECOVERY_FAILED" }, 503);
 
     if (request.method === "GET" && url.pathname === "/internal/health") {
       return jsonResponse({ ok: true, service: "mine-room" });
@@ -192,6 +215,22 @@ export class MineRoom {
       return;
     }
 
+    if (isRecord(parsed) && parsed.v !== MINE_PROTOCOL_VERSION) {
+      this.sendError(socket, "PROTOCOL_MISMATCH", "客户端协议版本不兼容，请刷新页面。");
+      // Keep credentials: an old tab must not lose its seat merely because
+      // the server upgraded while it was disconnected.
+      this.closeSocket(socket, 4406, "Please refresh the page");
+      return;
+    }
+    const admitted = this.readAttachment(socket);
+    const now = Date.now();
+    if (!this.budget.take(`connection:${admitted.connectionId}`, now, 30, 15)
+      || (admitted.identity && !this.budget.take(`member:${admitted.identity.playerId}`, now, 30, 15))
+      || !this.budget.take("room", now, 120, 60)) {
+      this.sendError(socket, "RATE_LIMITED", "操作太频繁，请稍后再试。", isCommandMessage(parsed) ? parsed.id : undefined, true);
+      return;
+    }
+
     await this.enqueue(async () => {
       const attachment = this.readAttachment(socket);
       if (!attachment.joined) {
@@ -209,6 +248,9 @@ export class MineRoom {
         return;
       }
       await this.handleCommand(socket, attachment, parsed);
+    }, true).catch((error: unknown) => {
+      if (error instanceof MineRoomEngineError) this.sendError(socket, error.code, error.message, isCommandMessage(parsed) ? parsed.id : undefined, true);
+      else throw error;
     });
   }
 
@@ -230,6 +272,7 @@ export class MineRoom {
 
   async alarm(): Promise<void> {
     await this.enqueue(async () => {
+      if (this.restoreFailed) return;
       this.closeExpiredPendingSockets(Date.now());
       if (!this.engine) {
         await this.scheduleNextAlarm();
@@ -276,6 +319,7 @@ export class MineRoom {
   }
 
   private async reserveMember(request: Request): Promise<Response> {
+    await this.advanceRoom();
     if (!this.engine || this.retiring) return jsonResponse({ error: "没有找到这个房间。" }, 404);
     try {
       const body = await request.json() as InternalJoinRequest;
@@ -298,6 +342,7 @@ export class MineRoom {
   }
 
   private async openSocket(request: Request): Promise<Response> {
+    await this.advanceRoom();
     if (!this.engine || this.retiring) return jsonResponse({ error: "没有找到这个房间。" }, 404);
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return jsonResponse({ error: "需要 WebSocket upgrade。" }, 426);
@@ -327,6 +372,7 @@ export class MineRoom {
     attachment: SocketAttachment,
     message: JoinMessage,
   ): Promise<void> {
+    await this.advanceRoom();
     if (!this.engine || this.retiring) {
       this.sendError(socket, "ROOM_NOT_FOUND", "没有找到这个房间。");
       this.closeSocket(socket, 4404, "Room not found");
@@ -373,6 +419,7 @@ export class MineRoom {
         v: MINE_PROTOCOL_VERSION,
         type: "welcome",
         identity,
+        lastAcceptedSequence: this.engine.lastAcceptedSequence(identity.playerId),
         snapshot: { room, serverTime: now },
       });
       this.broadcastSnapshot(room, now, socket);
@@ -400,18 +447,15 @@ export class MineRoom {
       this.closeSocket(socket, 4408, "Session replaced");
       return;
     }
+    await this.advanceRoom();
+    if (!this.engine) return;
     const now = Date.now();
-    const advanced = this.engine.advance(now);
-    if (advanced.expired) {
-      await this.retireRoom("ROOM_EXPIRED", "房间长时间没有活动，已经关闭。", "Room expired");
-      return;
-    }
-    if (advanced.changed) {
-      await this.persist();
-      if (advanced.room) this.broadcastSnapshot(advanced.room, now);
-    }
 
     if (message.command.op === "sync") {
+      if (!this.budget.take(`sync:${playerId}`, now, 1, 1)) {
+        this.sendError(socket, "RATE_LIMITED", "同步太频繁，请稍后再试。", message.id, true);
+        return;
+      }
       const room = this.engine.snapshot(now);
       this.sendSnapshot(socket, room, now);
       this.acknowledge(socket, message, room.version);
@@ -432,17 +476,32 @@ export class MineRoom {
       return;
     }
     if (decision.kind === "stale") {
-      this.sendError(socket, "STALE_SEQUENCE", "这条命令已经过期，已同步最新棋盘。", message.id, true);
+      this.sendError(socket, "STALE_SEQUENCE", "这条命令已经过期，已同步最新棋盘。", message.id, true, decision.previousSequence);
       this.sendSnapshot(socket, this.engine.snapshot(), Date.now());
       return;
     }
 
+    // Reserve outcome capacity before any mutation. Refusing new work must not
+    // consume a sequence or evict an earlier command that can still be retried.
+    if (message.command.op !== "leaveMembership") {
+      try {
+        this.engine.assertReceiptCapacity(playerId, now);
+      } catch (error) {
+        const normalized = this.normalizeError(error);
+        this.sendError(socket, normalized.code, normalized.message, message.id, normalized.retryable);
+        return;
+      }
+    }
+
     try {
+      if (message.expiresAt <= now || message.expiresAt > now + MAX_COMMAND_LIFETIME_MS) {
+        throw new MineRoomEngineError("这条命令已经过期。", 409, "COMMAND_EXPIRED");
+      }
       const result = this.applyCommand(playerId, message.command);
       if (message.command.op !== "leaveMembership") {
         this.engine.recordSequence({ playerId, id: message.id, sequence: message.sequence });
       }
-      await this.persist();
+      await this.persist(!result.changed);
 
       if (message.command.op === "switchRole" && "identity" in result) {
         const switched = result as EngineMutationResult & { identity: RoomIdentity };
@@ -460,7 +519,7 @@ export class MineRoom {
       }
 
       this.acknowledge(socket, message, result.revision);
-      this.broadcastSnapshot(result.room, Date.now());
+      if (result.changed) this.broadcastSnapshot(result.room, Date.now());
       await this.scheduleNextAlarm();
       if (message.command.op === "leaveMembership") {
         this.closeSocket(socket, 1000, "Membership left");
@@ -475,18 +534,29 @@ export class MineRoom {
             sequence: message.sequence,
             error: normalized,
           });
-          await this.persist();
+          await this.persist(true);
         }
       } catch (receiptError) {
         console.error("Unable to persist rejected command receipt", receiptError);
       }
       this.sendError(socket, normalized.code, normalized.message, message.id, normalized.retryable);
+      if (normalized.code === "STALE_ROUND" || normalized.code === "CONFLICT") {
+        this.sendSnapshot(socket, this.engine.snapshot(), Date.now());
+      }
     }
   }
 
   private applyCommand(playerId: string, command: RoomCommand) {
     if (!this.engine) throw new MineRoomEngineError("没有找到这个房间。", 404, "ROOM_NOT_FOUND");
-    if (command.op === "action") return this.engine.handleAction({ playerId, action: command.action });
+    if (command.op === "action") {
+      if (typeof command.roundId !== "string" || !command.roundId
+        || !command.action || typeof command.action !== "object"
+        || ((command.action.type === "restart" || command.action.type === "changeDifficulty")
+          && !Number.isSafeInteger(command.observedGameRevision))) {
+        throw new MineRoomEngineError("操作缺少局次或棋盘版本，请刷新页面。", 400, "BAD_REQUEST");
+      }
+      return this.engine.handleAction({ playerId, action: command.action, roundId: command.roundId, observedGameRevision: command.observedGameRevision });
+    }
     if (command.op === "chat") {
       return this.engine.postChat({
         playerId,
@@ -500,6 +570,7 @@ export class MineRoom {
   }
 
   private async disconnectSocket(socket: WebSocket): Promise<void> {
+    await this.advanceRoom();
     if (!this.engine) return;
     const attachment = this.readAttachment(socket);
     if (!attachment.joined || !attachment.identity) return;
@@ -513,15 +584,43 @@ export class MineRoom {
     }
   }
 
-  private async persist(): Promise<void> {
+  private async persist(receiptsOnly = false): Promise<void> {
     if (!this.engine) return;
     const serialized = this.engine.serialize();
     const { chat, receipts, ...core } = serialized;
-    await this.ctx.storage.put({
-      [CORE_KEY]: core,
-      [CHAT_KEY]: chat,
-      [RECEIPTS_KEY]: receipts,
-    });
+    const sequences = Object.fromEntries(core.members.map((member) => [member.playerId, member.lastSequence]));
+    const receiptPartitions = Object.fromEntries(core.members.map((member) => [
+      memberReceiptsKey(member.playerId), receipts.filter((receipt) => receipt.playerId === member.playerId),
+    ]));
+    const memberIds = new Set(core.members.map((member) => member.playerId));
+    const removedKeys = [...this.persistedReceiptPlayerIds]
+      .filter((playerId) => !memberIds.has(playerId)).map(memberReceiptsKey);
+    // Sequence watermarks and receipts are committed together, including no-ops.
+    // Per-member keys keep the retained window below the storage value limit.
+    // Issue writes/deletes without an intervening await so storage coalesces
+    // them atomically; departing members must not leave unbounded stale keys.
+    const writes = [this.ctx.storage.put({
+      ...(!receiptsOnly ? { [CORE_KEY]: core, [CHAT_KEY]: chat } : {}),
+      [RECEIPTS_KEY]: [],
+      ...receiptPartitions,
+      [SEQUENCES_KEY]: sequences,
+    })];
+    if (removedKeys.length) writes.push(this.ctx.storage.delete(removedKeys).then(() => undefined));
+    await Promise.all(writes);
+    this.persistedReceiptPlayerIds = memberIds;
+  }
+
+  private async advanceRoom(): Promise<void> {
+    if (!this.engine) return;
+    const now = Date.now();
+    const result = this.engine.advance(now);
+    if (result.expired) {
+      await this.retireRoom("ROOM_EXPIRED", "房间长时间没有活动，已经关闭。", "Room expired");
+    } else if (result.changed) {
+      await this.persist();
+      if (result.room) this.broadcastSnapshot(result.room, now);
+    }
+    await this.scheduleNextAlarm();
   }
 
   private async scheduleNextAlarm(): Promise<void> {
@@ -573,7 +672,8 @@ export class MineRoom {
   }
 
   private broadcastSnapshot(room: PublicRoom, now: number, excluded?: WebSocket): void {
-    for (const socket of this.joinedSockets(excluded)) this.sendSnapshot(socket, room, now);
+    const payload = JSON.stringify({ v: MINE_PROTOCOL_VERSION, type: "snapshot", snapshot: { room, serverTime: now } });
+    for (const socket of this.joinedSockets(excluded)) this.safeSend(socket, payload);
   }
 
   private sendSnapshot(socket: WebSocket, room: PublicRoom, serverTime: number): void {
@@ -630,6 +730,7 @@ export class MineRoom {
     message: string,
     id?: string,
     retryable?: boolean,
+    lastAcceptedSequence?: number,
   ): void {
     const payload: ServerMessage = {
       v: MINE_PROTOCOL_VERSION,
@@ -638,14 +739,15 @@ export class MineRoom {
       message,
       ...(id ? { id } : {}),
       ...(retryable !== undefined ? { retryable } : {}),
+      ...(lastAcceptedSequence !== undefined ? { lastAcceptedSequence } : {}),
     };
     this.safeSend(socket, payload);
   }
 
-  private safeSend(socket: WebSocket, message: ServerMessage): void {
+  private safeSend(socket: WebSocket, message: ServerMessage | string): void {
     if (socket.readyState !== 1) return;
     try {
-      socket.send(JSON.stringify(message));
+      socket.send(typeof message === "string" ? message : JSON.stringify(message));
     } catch (error) {
       console.error("Unable to send mine room message", error);
     }
@@ -690,14 +792,20 @@ export class MineRoom {
     return jsonResponse({ error: "房间服务暂时开小差了。" }, 500);
   }
 
-  private enqueue(task: () => Promise<void> | void): Promise<void> {
-    const run = this.operationQueue.then(task, task);
+  private enqueue(task: () => Promise<void> | void, bounded = false): Promise<void> {
+    if (bounded && this.queuedOperations >= MAX_QUEUED_OPERATIONS) {
+      return Promise.reject(new MineRoomEngineError("房间繁忙，请稍后再试。", 503, "RATE_LIMITED", true));
+    }
+    this.queuedOperations += 1;
+    const run = this.operationQueue.then(task, task).finally(() => { this.queuedOperations -= 1; });
     this.operationQueue = run.then(() => undefined, () => undefined);
     return run;
   }
 
   private enqueueResponse(task: () => Promise<Response>): Promise<Response> {
-    const run = this.operationQueue.then(task, task);
+    if (this.queuedOperations >= MAX_QUEUED_OPERATIONS) return Promise.resolve(jsonResponse({ error: "房间繁忙，请稍后再试。" }, 503));
+    this.queuedOperations += 1;
+    const run = this.operationQueue.then(task, task).finally(() => { this.queuedOperations -= 1; });
     this.operationQueue = run.then(() => undefined, () => undefined);
     return run;
   }

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
+import { MINE_PROTOCOL_VERSION as protocolVersion } from "../shared/mine-protocol.ts";
 
 const baseUrl = (process.env.MINEFIELD_URL ?? "http://127.0.0.1:8787").replace(/\/+$/, "");
 const socketBase = baseUrl.replace(/^http/, "ws");
-const protocolVersion = 1;
 
 function endpoint(pathname) {
   return `${baseUrl}${pathname}`;
@@ -84,6 +84,10 @@ class RoomClient {
       }
 
       const index = this.messages.push(message) - 1;
+      if (message.snapshot) {
+        this.room = message.snapshot.room;
+        this.serverOffset = message.snapshot.serverTime - Date.now();
+      }
       for (const waiter of [...this.waiters]) {
         if (index < waiter.startIndex || !waiter.predicate(message)) continue;
         this.waiters = this.waiters.filter((candidate) => candidate !== waiter);
@@ -127,10 +131,12 @@ class RoomClient {
     assert.equal(outcome.identity.code, this.session.code);
     assert.equal(outcome.identity.playerId, this.session.playerId);
     this.session = { ...this.session, ...outcome.identity, token: this.session.token };
+    this.sequence = Math.max(this.sequence, outcome.lastAcceptedSequence);
     return outcome;
   }
 
   send(command, { id = crypto.randomUUID(), sequence } = {}) {
+    if (command.op === "action") command = { ...command, roundId: this.room.roundId, observedGameRevision: this.room.game.revision };
     const nextSequence = sequence ?? this.sequence + 1;
     this.sequence = Math.max(this.sequence, nextSequence);
     const message = {
@@ -138,6 +144,7 @@ class RoomClient {
       type: "command",
       id,
       sequence: nextSequence,
+      expiresAt: Date.now() + (this.serverOffset ?? 0) + 30_000,
       command,
     };
     this.sendRaw(message);
@@ -313,6 +320,35 @@ try {
     1,
   );
 
+  const delayed = {
+    v: protocolVersion, type: "command", id: crypto.randomUUID(), sequence: ++guest.sequence,
+    expiresAt: Date.now() + 30_000,
+    command: { op: "action", action: { type: "mark", index: 0, state: "flagged" }, roundId: guest.room.roundId },
+  };
+  const restartHostCursor = host.cursor();
+  const restartGuestCursor = guest.cursor();
+  const restartRound = host.send({ op: "action", action: { type: "restart" } });
+  await Promise.all([
+    host.waitFor((message) => message.type === "ack" && message.id === restartRound.id, { startIndex: restartHostCursor }),
+    host.waitFor((message) => message.type === "snapshot" && message.snapshot.room.roundId !== delayed.command.roundId, { startIndex: restartHostCursor }),
+    guest.waitFor((message) => message.type === "snapshot" && message.snapshot.room.roundId !== delayed.command.roundId, { startIndex: restartGuestCursor }),
+  ]);
+  const delayedCursor = guest.cursor();
+  guest.sendRaw(delayed);
+  const rejectedRound = await guest.waitFor((message) => message.type === "error" && message.id === delayed.id, { startIndex: delayedCursor });
+  assert.equal(rejectedRound.code, "STALE_ROUND");
+  assert.equal(guest.room.game.status, "ready");
+  assert.equal(guest.room.game.flags, 0);
+
+  const retainedCursor = host.cursor();
+  const retained = host.send({ op: "chat", content: `retained-result-${suffix}` });
+  const retainedAck = await host.waitFor((message) => message.type === "ack" && message.id === retained.id, { startIndex: retainedCursor });
+  const rejectionCursor = host.cursor();
+  const rejected = host.send({ op: "unknown" });
+  const retainedError = await host.waitFor((message) => message.type === "error" && message.id === rejected.id, { startIndex: rejectionCursor });
+  assert.equal(retainedError.code, "BAD_REQUEST");
+  const receiptReplayStartedAt = performance.now();
+
   const guestOfflineCursor = guest.cursor();
   await host.disconnect();
   await guest.waitFor(
@@ -323,10 +359,21 @@ try {
     { startIndex: guestOfflineCursor },
   );
 
+  // Each accepted no-op creates a receipt without changing the board. Exercise
+  // the former shared 256-entry eviction path through actual workerd sockets.
+  for (let index = 0; index < 256; index++) {
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    const cursor = guest.cursor();
+    const peerCommand = guest.send({ op: "action", action: { type: "mark", index: 0, state: "hidden" } });
+    const outcome = await guest.waitFor((message) => message.id === peerCommand.id && (message.type === "ack" || message.type === "error"), { startIndex: cursor });
+    assert.equal(outcome.type, "ack");
+  }
+
   const guestOnlineCursor = guest.cursor();
-  reconnectedHost = new RoomClient(roomCode, host.session, { sequence: host.sequence });
+  reconnectedHost = new RoomClient(roomCode, host.session);
   const reconnectWelcome = await reconnectedHost.connect();
   assert.equal(reconnectWelcome.identity.playerId, hostPlayerId);
+  assert.ok(reconnectWelcome.lastAcceptedSequence >= host.sequence);
   assert.equal(
     reconnectWelcome.snapshot.room.players.find((player) => player.id === hostPlayerId)?.online,
     true,
@@ -338,6 +385,15 @@ try {
       ),
     { startIndex: guestOnlineCursor },
   );
+
+  for (const [envelope, expected] of [[retained, retainedAck], [rejected, retainedError]]) {
+    assert.ok(Date.now() + (reconnectedHost.serverOffset ?? 0) < envelope.expiresAt, "Replay must still be inside the original 30s deadline");
+    const cursor = reconnectedHost.cursor();
+    reconnectedHost.sendRaw(envelope);
+    const replayed = await reconnectedHost.waitFor((message) => message.id === envelope.id && (message.type === "ack" || message.type === "error"), { startIndex: cursor });
+    assert.deepEqual(replayed, expected);
+  }
+  const receiptReplayElapsedMs = Math.round(performance.now() - receiptReplayStartedAt);
 
   const reconnectCursor = reconnectedHost.cursor();
   const reconnectSync = reconnectedHost.send({ op: "sync" });
@@ -367,6 +423,7 @@ try {
   let activeRoom = reconnectSnapshot.snapshot.room;
   let incidentRoom = null;
   for (let attempt = 0; attempt < 200 && !incidentRoom; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 75));
     if (activeRoom.game.status === "won" || activeRoom.game.status === "lost") {
       const restartCursor = reconnectedHost.cursor();
       const restart = reconnectedHost.send({ op: "action", action: { type: "restart" } });
@@ -454,7 +511,12 @@ try {
     pushLatencyMs,
     chatBroadcastToPeer: true,
     duplicateSequenceWasIdempotent: true,
+    peerReceiptTraffic: 256,
+    successAndRejectionReplayedAfterPeerTraffic: true,
+    receiptReplayElapsedMs,
     reconnectedToSamePlayer: true,
+    sequenceRecoveredFromServer: true,
+    crossPlayerOldRoundRejected: true,
     hibernationHeartbeatAutoResponse: true,
     alarmRevivalWithoutPolling: true,
     alarmRevivalMs,
